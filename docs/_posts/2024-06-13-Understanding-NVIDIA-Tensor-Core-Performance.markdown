@@ -113,7 +113,7 @@ For the rest of this article I will discuss a series of 5 kernels that got me to
 4. fast shared memory index calculations
 5. tuning tile dimensions
 
-# Kernel 1
+# Kernel 1 - Hierarchical Tiling
 The structure of Kernel 1 provides a foundation that I iterated on for the next 4 kernels. It has a 4 level hierarchical tiled structure as shown in the image below. Based on some experiments, for a single precision GEMM calculation not running on tensor cores, a 4 level tiling structure similiar to this one is sufficient to keep the compute units fully fed, and get close to cuBLAS performance. However, for a tensor core GEMM, it is only the starting point! If at this point you find yourself confused, and are interested in reading about a series of 10ish kernels that build up to a kernel like this one, I highly recommend [this](https://siboehm.com/articles/22/CUDA-MMM) article.
 
 ![tiling](/images/my_tiles_2.png)
@@ -124,21 +124,13 @@ This diagram turned out a bit hectic, but I was trying to show how the loop nest
 
 * **CUDA Kernel / GPU level**: The GPU is reading the three input matrices, $A$, $B$, and $C$ from global memory, and writing the output matrix $D$ to global memory. Each thread block is looping over the `K` dimension (aka the 'inner' dimension) of $A$ and $B$. This loop is incrementing `block_k` in steps of size `BK`. At each iteration we are copying the blue blocktiles from global memory to shared memory.
 
-* **Thread Block / SM level**: At this point the blue subtiles of $A$ and $B$ that a particular thread block needs to compute a `BM,BN` tile of the output have been copied into shared memory. This thread block is running on one of the 16 SMs on the T4, and the shared memory is local to that SM and fast to access. Within the thread block there are 256 threads, which is 8 warps containing 32 threads each. The `BM,BN` tile of the output is partitioned 8 ways, so that each of the 8 warps can work concurrently on the compute. Each of the warps is looping over the inner dimension within the block tile, this loop is incrementing `warp_k` in steps of size `WK`. At each iteration we are copying the green warp tiles from shared memory to register memory.
+* **Thread Block / SM level**: At this point the blue subtiles of $A$ and $B$ that a particular thread block needs to compute a `BM,BN` tile of the output have been copied into shared memory. This thread block is running on one of the 16 SMs on the GPU, and the shared memory is local to that SM and fast to access. Within the thread block there are 256 threads, which is 8 warps containing 32 threads each. Within the thread block, the `BM,BN` tile of the output is partitioned 8 ways, so that each of the 8 warps can work concurrently on the compute. Each of the warps is looping over the inner dimension within the block tile, this loop is incrementing `warp_k` in steps of size `WK`. At each iteration we are copying the green warp tiles from shared memory to register memory.
 
-* **Warp / SM Partition**: At this point the green warp tiles within the blue block tiles have been copied into register memory, and it is the responsibility of a particular warp, running on one of the 4 partitions on the [Turing SM](https://images.app.goo.gl/Z2VVQQgXWTMddBraA) to compute the `WM` by `WN` tile of the output. **TODO: discussion about registers here**. 
+* **Warp / SM Partition**: At this point the green warp tiles within the blue block tiles have been copied into register memory, and it is the responsibility of a particular warp, running on one of the 4 partitions on the [Turing SM](https://images.app.goo.gl/Z2VVQQgXWTMddBraA) to compute the `WM` by `WN` tile of the output. Each warp computes its tile of the output by taking an outer product between the `WM,WK` tile of A and the `WK,WN` tile of B. Inside the three nested loops that compute the outer product, the we an MMA sync operation.
 
+* **Tensor Core Op**: Finally we get down to the last level of the hierarchy, which is a single tensor core op, this is a single hardware accelerated (16,8) x (8,8) = (16,8) matrix multiply.
 
-
-
-
-
-
-
-* **bottom right** The size of each warp tile in $D$ is 64x64, and a single call to our `m16n8k8` tensor core instruction computes a (16,8) tile of the output. This means each warp must call this instruction 32 times to compute its entire (64,64) tile. Since we are considering the warp as atomic, rather than adding another layer of parallelism by assigning each of the 32 threads in the warp their own portion of the output, the entire warp is synchronously looping over the output tile, computing one (16,8) chunk each iteration of the loop.
-
-Here is some pseduocode for what the loop structure of the kernel looks like. Since this is a CUDA kernel, thousands of threads on the GPU are running this code concurrently, the threads are organized hierarchically into blocks, and within the blocks, warps. The following variables are used for bookkeeping, defining them up front allows the pseudocode to be somewhat concise. For readability, I am pretending all of the matrices involved are numpy arrays.
-
+Here is some pseduocode all in one place, for readability, I am pretending all of the matrices involved are numpy arrays.
 
 
 ```c++
@@ -179,17 +171,97 @@ for (block_k = 0; block_k < K; block_k += BK)
 }
 ```
 
-There are 8 tensor cores per Turing SM, and 8 warps per thread block in our kernel. This means there is 1 warp per tensor core. Since our ability to reach peak performance will be limited if we can't issue instructions to the tensor cores fast enough, we want as many warps per block as possible, and each warp to issue as many instructions to tensor cores as possible. We can't have infinite warps, because each warp requires a substantial amount of registers on the SM. A Turing SM has a total of 64k 32-bit registers, so the more registers per warp we use, the less warps we can have per thread block. Experimenting with tradeoffs between per warp resource usage, and SM occupancy is central part of CUDA kernel optimization. In this case, I found that 8 warps per blocks provides enough occupancy to keep the tensor cores busy, while also giving each warp enough registers
+This kernel (code [here](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel1.cu)) is the starting point, it does not get close to cuBLAS level performance.
+![kernel1](/images/kernel1.png)
+
+
+# Kernel 2 - Vectorized memory copy and loop unrolling
+In order to improve the performance of our code, we need to know why it is slow. When writing CUDA kernels, the best tool to use for this is called NSight Compute, a profiler developed by NVIDIA that gives lots of detailed metrics about how a kernel is interacting with the hardware. The first place I typically look is the section called "Warp State Statistics". As a kernel is executing, each warp is being issued instructions by a scheduler. In an ideal world, the scheduler would be able to issue a new instruction each clock cycle. In the real world, it is very hard to write a kernel that can issue a new instruction every cycle, there are all sorts of reasons why on a given cycle, a warp may not be capable of executing its next instruction and will instead "stall" i.e. do nothing. The reasons for stalling can be due to capacity limits of various hardware pipelines, memory latency, or sychronization points in our kernel which require all the threads running on an SM to wait for all the other threads to catch up. The Warp State Statistics section tells us how many clock cycles the average warp spends stalled, per average instruction issued, broken down across a bunch of different categories. This gives us the information we need to target our optimizations to the least performant parts of our kernel. Here is a screenshot of what the Warp State section for Kernel 1.
+![warp_state_kernel1](/images/warp_state_kernel1.png)
+The "Warp Cycles Per Issued Instruction" field tells us that on average for each instruction issued, warps spend about ~30 cycles idle, and the table below tells us that 16 of these 30 cycles are due to the "Long Scoreboard" stall category. 
+
+[Scoreboarding](/link/here) is an algorithm implemented in the hardware of most processors for tracking when the data dependencies for the next instruction have arrived in the registers they need to be in for the instruction to execute. Most modern CPUs are able to reorder instructions on the fly such that instructions whose operands are ready can execute ahead of instructions whose operands have yet to arrive in registers. The reordering is done in hardware, subject to constraints imposed by the data dependencies between subsequent instructions. This is called [out of order execution](/link/here) and it is a rather fancy technique for hiding memory latency. GPUs generally do not reorder instructions, I would imagine because the logic required for reordering instructions consumes a fair amount of precious transistors on the chip, and since GPUs are designed for [throughput](/link/here) these transistors are better spent on things like tensor cores.
+
+GPUs do however perform scoreboarding in hardware, and when the data required to execute the next instruction has not arrived in register memory, the warp that is executing just waits for its data to arrive. The "Long Scoreboard Stall" counts the average number of cycles that warps spend stalled waiting for data to arrive from global memory. The fact that this stall reason accounts for ~50% of all the cycles that warps spend idle tells us that the performance of Kernel 1 is primarily limited by **memory latency**. This tells us we should focus on the code that is moving data from global memory onto the chip, and figure out how to minimize the latency per byte moved.
+
+#### Global Memory Reads / Shared Memory Writes
+Reading a rectangular tile of data from global memory, and writing it to shared memory is the first thing that occurs on each iteration of the outer loop of the kernel. The easiest way to do this is for adjacent threads to access adjacent values in global memory, and write data to shared memory in the same layout that it came from in global memory. This access pattern is optimal both for reading global memory, and writing shared memory. Here is the first data transfer that I wrote:
+
+```c++
+__device__ void tileMemcpy(
+    half* src,
+    half* dst,
+    const unsigned int src_stride,
+    const unsigned int tile_rows,
+    const unsigned int tile_cols
+)
+{
+    // flatten out 2d grid of threads into in order of increasing threadIdx.x
+    const unsigned int thread_idx = threadIdx.y * blockDim.x + threadIdx.x;
+    const unsigned int num_threads = blockDim.x * blockDim.y;
+    
+    // # of threads is multiple of # of columns in the tile
+    assert(num_threads % tile_cols == 0);
+    
+    // assign each thread a row/column in the tile, calculate the column step
+    const unsigned int row_step = num_threads / tile_cols;
+    const unsigned int thread_row = thread_idx / tile_cols;
+    const unsigned int thread_col = thread_idx % tile_cols;
+    
+    for (unsigned int r = thread_row; r < tile_rows; r+=row_step)
+    {
+        dst[r * tile_cols + thread_col] =  src[r * src_stride + thread_col];
+    }
+}
+```
+Looking at the SASS corresponding to this `tileMemcpy` function in [godbolt](https://godbolt.org/z/1MeavE3GG), we can see that the copy operation inside the loop `dst[...] = src[...]` is actually two operations from the lower level perspective of SASS: first, a load of `sizeof(half) = 2 bytes` from global memory into a register, and then a store of 2 bytes from the register to the `dst` address. The long scoreboard stall prevents the store from taking place until the value we are loading has arrived in the register.
+
+Here is a visualization of how this loop is executing, for a single thread:
+![memory_latency](/images/memory_latency.png)
+Latency in between the load and the store is inevitable: a request is sent to a DRAM controller, data is fetched from DRAM and then transmitted over bus. Unless we hack the laws of physics or invent a time machine we can't get rid of the latency. But what we can do is **hide** it.
+
+Latency hiding is a central concept in high performance computing, and at its core is very simple. It just means that if we are performing an operation $X$ that has some latency, we want to be doing other useful work while $X$ is happening, rather than wait and do nothing. For example, if I wake up and decide I want an omlette, I would first turn on the burner and let the pan warm up, and while that is happening I would crack the eggs and grate cheese. This order of operations hides the latency of warming up the pan with the cracking of eggs and grating of cheese. If I am hungry and eager to eat the finished omlette as soon as possible, it would be silly to idly stand there and watch as the pan warms up.
+
+The same principle applies to hiding the latency of the global memory loads in `tileMemcpy`. Since the copy operation is happening inside a loop, each thread is performing multiple loads and multiple stores, in an order like `load (stall) store, load (stall) store, ...`. What if we were able to rearrange these so that the order is `load load load (stall) store, store, store`. In this later ordering the loads are happening concurrently, and we can say that the latency of each load is being hidden by the other loads. The easiest way to accomplish the later ordering is by unrolling the loop in `tileMemcpy`. If we can unroll the loop, `nvcc` should be smart enough to reorder the instructions so that the global memory loads are hiding each others latency. In this case the compiler is doing for us what a CPU would do in hardware on the fly. 
+
+If we want to unroll the loop, the number of loop iterations must be known at compile time. The number of loop iterations is a function of the number of threads per block, and the block tile dimensions. Both of these are fixed at compile time, so passing them as template parameters into `tileMemcpy` and calculating the number of iterations as a function of these, and adding a `#pragma unroll` does the trick.
+
+```c++
+template<unsigned int TILE_ROWS,
+unsigned int TILE_COLS,
+unsigned int NUM_THREADS>
+__device__ __forceinline__ void tileMemcpyUnrolled(
+    half* src,
+    half* dst,
+    const unsigned int src_stride
+)
+{
+    // # of threads is multiple of # of columns in the tile
+    static_assert(NUM_THREADS % TILE_COLS == 0);
+    
+    // flatten out 2d grid of threads into in order of increasing threadIdx.x
+    const unsigned int thread_idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // assign each thread a row/column in the tile, calculate how many iterations we need
+    // to cover the whole tile
+    constexpr unsigned int ROW_STEP = NUM_THREADS / TILE_COLS;
+    constexpr unsigned int NUM_ITERS = TILE_ROWS / ROW_STEP;
+    unsigned int thread_row = thread_idx / TILE_COLS;
+    const unsigned int thread_col = thread_idx % TILE_COLS;
+    
+    #pragma unroll
+    for (unsigned int i = 0; i < NUM_ITERS; i++)
+    {
+        dst[thread_row * TILE_COLS + thread_col] =  src[thread_row * src_stride + thread_col];
+        thread_row += ROW_STEP;
+    }
+    
+}
+```
 
 
 
 
-
-
-
-
-
-
-
+ 
 ### Resources/Citations
 
