@@ -5,9 +5,11 @@ title:  "Optimizing matrix multiplication on NVIDIA Tensor Cores"
 date:   2024-06-13 08:52:08 -0600
 categories: jekyll update
 --- -->
+
 {% include mathjax.html %}
 
-
+* TOC
+{:toc}
 
 # Introduction
 This post details my recent efforts to write an optimized matrix multiplication kernel in CUDA using tensor cores on an NVIDIA Tesla T4 GPU. The goal is to compute $D = \alpha * A * B + \beta * C$, where $D,A,B$ and $C$ are large matrices full of half precision floating point numbers, and $\alpha$, $\beta$ are constants. This problem is usually reffered to as a **Ge**neralized **M**atrix **M**ultiply, or **GEMM** for short. My goal is to write a GEMM kernel with comparable throughput to cuBLAS's [Hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, cuBLAS is a highly optimized, closed source library of hand tuned kernels specific to each GPU architecture released by NVIDIA.
@@ -17,10 +19,10 @@ This post details my recent efforts to write an optimized matrix multiplication 
 
 Given their huge importance in the world today, when I started this project it felt to me like there is disproportionately little info and dialogue on the internet about how to use them directly in CUDA. I quickly learned this lack of info is probably because if you want to write a kernel that uses tensor cores at anywhere close to their full potentional, you need to employ some fairly tricky techniques to keep them fed, which in practice means  efficiently moving bytes through the memory heirarchy of the GPU, and overlapping compute with this data movement. But as with all rewarding engineering endeavors, with a little focus and persistence I started to see the cleverness and elegance in algorithmic details which once seemed uncomfortably complicated and esoteric, which is what moved me to write this article!
 
-The [roofline](https://en.wikipedia.org/wiki/Roofline_model) chart below captures in a nutshell why writing a kernel which achieves peak performance with tensor cores is hard. Roofline charts plot the arithmetic throughput you can achieve on a given piece of hardware as a function of the data reuse of a particular algorithm. The x-axis corresponds to data reuse in units of FLOPs/byte, this is a property of a particular implementation of a kernel. It measures how many FLOPs are performed on each byte read from memory. The y-axis shows FLOP/sec which means at a given level of data reuse, how many floating point operations can this piece of hardware complete in a second. For each roofline, the points on the x axis to the left of the cusp correspond to levels of data reuse that result in an algorithm being "memory bound", that is the floating point throughput we can achieve is limited by how much data we can move onto the chip. The points on the x axis to the right of the cusp correspond to higher levels of data reuse that result in an algorithm being "compute bound", this means we are moving enough data onto the chip to keep our compute units fully fed, and our throughput is limited by the FLOP/s of the device, which is a huge number, rather than the memory bandwidth, which comparitively is a smaller number. In this case for the Tesla T4, the tensor cores are capable of close to $65*10^{12}$ or $65,000,000,000,000$ half precision FLOP/s, which is about 8x the throughput of CUDA cores performing single precision math[^1]. 
+The [roofline](https://en.wikipedia.org/wiki/Roofline_model) chart below captures in a nutshell why writing a kernel which achieves peak performance with tensor cores is hard. Roofline charts plot the arithmetic throughput you can achieve on a given piece of hardware as a function of the data reuse of a particular algorithm. The x-axis corresponds to data reuse in units of FLOPs/byte, this is a property of a particular implementation of a kernel. It measures how many FLOPs are performed on each byte read from memory. The y-axis shows FLOP/sec which means at a given level of data reuse, how many floating point operations can this piece of hardware complete in a second. For each roofline, the points on the x axis to the left of the cusp correspond to levels of data reuse that result in an algorithm being "memory bound", that is the floating point throughput we can achieve is limited by how much data we can move onto the chip. The points on the x axis to the right of the cusp correspond to higher levels of data reuse that result in an algorithm being "compute bound", this means we are moving enough data onto the chip to keep our compute units fully fed, and our throughput is limited by the FLOP/s of the device, which is a huge number, rather than the memory bandwidth, which comparitively is a smaller number. In this case for the Tesla T4, the tensor cores are capable of close to $65*10^{12}$ or $65,000,000,000,000$ half precision FLOP/s, which is about 8x the throughput of CUDA cores performing single precision math. The FLOP/s number found on the spec sheet is usually conditioned with the word "theoretical" because in practice, it is physically impossible for the gpu to achieve this throughput for any sustained amount of time without melting or catching on fire, for an excellent explanation of why this is see [here](https://www.thonking.ai/p/strangely-matrix-multiplications) 
 ![roofline](/images/roofline1.png)
 
-[^1]: The FLOP/s number found on the spec sheet is usually conditioned with the word "theoretical" because in practice, it is physically impossible for the gpu to achieve this throughput for any sustained amount of time without melting or catching on fire, for an excellent explanation of why this is see [here](https://www.thonking.ai/p/strangely-matrix-multiplications)
+
 
 From the perspective of algorithm design, this huge increase in throughput of tensor cores is something of a blessing and a curse. The blessing is that tensor cores are powerful, their theoretical max throughput is 8x that of CUDA cores. The tricky part is that in order to reach peak performance with tensor cores, according to the simplified view of this roofline model we need to write an algorithm that has about 8x more data reuse than an algorithm which achieves peak single precision performance.
 
@@ -28,7 +30,8 @@ In practice, there are lots of details this chart does not capture. It simplifie
 
 I was inspired to work on this after reading [this](https://siboehm.com/articles/22/CUDA-MMM) excellent article in which the author takes on the same endeavor, but for single precision math. I naively thought something along the lines of "I'll just write something similiar to kernel 10 from Simon's article, swap in some inlined PTX to call tensor cores inside the inner loop, and call it a day!" This turned out to be incorrect, the kernels discussed in this article start from a similiar place to where Simon's article ends. I am trying to make this article as self contained as possible, which necessarily means it is a bit long and meandearing but if you are really interested in this I would highly recommend reading that one first.
 
-# How to write a fast matrix multiplication, chapter 0
+# Background
+## How to write a fast matrix multiplication, chapter 0
 If you are interested in hardware accelerated linear algebra, one of the coolest and most innovative projects happening right now is called NVIDIA [CUTLASS](https://github.com/NVIDIA/cutlass). In their words:
 >CUTLASS is a collection of CUDA C++ template abstractions for implementing high-performance matrix-matrix multiplication (GEMM) and related computations at all levels and scales within CUDA.
 
@@ -36,9 +39,7 @@ It provides a set of modular and composable building blocks that provide abstrac
 ![gemm_hierarchy.png](/images/gemm-hierarchy.png)
 This is a visualization of algorithmic technique called hierarchical tiling, it is the current paradigm for writing performant number crunching algorithms on computers with multi-level memory hierarchies (which is pretty much every non-embedded computer we have today). I will come back to this image in a bit, but in order to build some intuition about what hierarchical tiling is and why we use it, I think it is helpful to go through an example of how being conscious of our computer's memory heirarchy can speed up a matrix multiplication.
 
-### How to not be memory bound (simple memory hierarchy)[^2]
-
-[^2]: The content in this section is a short and hand wavy verion of what is presented in Prof. Vuduc's Intro to HPC class at Georgia Tech, specifically the section called "Basic Model of Locality." All the lectures are available online for free [here](https://edstem.org/us/courses/47532/lessons/)
+## How to not be memory bound (simple memory hierarchy)
 
 In the 70 or so years it has been since humanity started building transistor based computers, the capacity for performing arithmetic has been growing along the moores law exponential, while the capacity for moving data from where it is stored to where it is computed upon has not been growing exponentially. This problem is called the [memory wall](https://en.wikipedia.org/wiki/Random-access_memory#Memory_wall) and it is one of the central problems in computer architecture today, especially for the heavy number crunching sorts of workloads that are required for running neural networks.
 
@@ -56,7 +57,7 @@ We can do better by considering the memory hierarchy of the computer that this a
 
 Like the first matrix multiplication, there are three nested loops, but in this version the three loops are iterating over $t$ by $t$ tiles rather than individual elements. Inside the third loop nest, we are transfering a tile of A and B each with $t^2$ elements from slow memory to fast memory. For each tile of A and B, we then have everything we need to compute a corresponding tile of D from entirely within fast memory, so we aren't paying any cost for memory access. In the diagram above, we only pay for memory accesses made on the left side of the dotted line, which is the part that corresponds to slow memory. Asymtotically, we are making $O((\frac{N}{t})^3 * t^2) = O(\frac{N^3}{t})$ slow memory accesses, and performing $O(N^3)$ compute (as with any regular, i.e. non [strassen](https://en.wikipedia.org/wiki/Strassen_algorithm) matrix multiplication). So our data reuse works out to $O(\frac{N^3}{\frac{N^3}{t}})=O(t)$. This means that the # of FLOPs performed per byte read from memory is proportional to the dimension of our tile size. The larger the tile size, the better chance we have at not being limited by memory bandwidth.
 
-### How to not be memory bound (real GPU memory hierarchy)
+## How to not be memory bound (real GPU memory hierarchy)
 Modern GPUs have more than two levels in their memory hierarchy, fast memory is not instantaneous, and slow memory is not infinite. The simplified example above is meant to provide intuition about data reuse, and how we can use out memory hierarchy to keep our compute units busy. But if we wanted to write a tiled matrix multiplication meant to run on a real GPU, how might we go about it? When designing a tiled algorithm for a real GPU, we need to consider these three types of hierarchy that we are dealing with:
 * Hierarchy in the matrix multplication: a large matrix multiplication can be broken down into lots of small matrix multiplications, and each of those small matrix multiplications can be further broken down into smaller matrix multiplications.
 * Hierarchy in the memory: lets focus on three levels in the memory hierarchy, in order from large/slow to small/fast: off chip DRAM -> on chip SRAM -> register memory.
@@ -66,7 +67,7 @@ The idea behind hierarchical tiling is to creating mappings between correspondin
 
 As we go from left to right in the image above, we are moving down levels in the hierarchy. On the far left, we have the whole GPU, responsible for the whole matrix multiplication problem, all of which is stored in DRAM. The matrices are broken down into tiles, each tile of the output and the corresponding tiles of the input is transfered to shared memory, which is fast on chip SRAM memory that is local to a single SM, and consequently local to the thread block which is running on that SM. Each of these tiles in shared memory is further broken down into smaller tiles that can fit in the register memory of a single warp. The compute, which in our case is tensor core operations, happens to/from register memory. In this heirarchical structure, faster memory types are used as a sort of "scratch pad" for slower memory. Data is transfer done in blocks from slower memory to faster memory, amortizing the fixed costs of requesting DRAM/SRAM over lots of elements, and making the most of the limited memory bandwidth. All of the reads and writes of individual elements are done out of and into registers, which is the fastest and smallest level of memory, with negligible latency and efficient granular access to invidiual values.
 
-# How to use Tensor Cores
+## How to use Tensor Cores
 
 Part of why GPUs are good for things like matrix multiplication is that instructions are issued to 32 threads at a time, this can be extremely efficient because the overhead of instruction issue is amortized across 32 threads (as opposed to 1 for a CPU). However, the 32 threads in a warp are still independent, [predication](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#control-flow-instructions) and other fancy compiler techniques are used to allow a thread within a warp to take its own execution path dependent on the value of data in its private register memory.
 
@@ -108,12 +109,13 @@ Given how many people and companies these days are buying NVIDIA GPUs almost exc
 
 For the rest of this article I will discuss a series of 5 kernels that got me to ~80% of cublas level performance on a tensor core GEMM. Each kernel builds on the previous one, and the themes of each are:
 1. hierarchical tiling
-2. shared memory swizzling
-3. async global memory copies (poor mans version)
-4. fast shared memory index calculations
-5. tuning tile dimensions
+2. vectorized/unrolled gmem->smem transfer
+3. shared memory swizzling
+4. async global memory copies (poor mans version)
+5. fast shared memory index calculations
+6. tuning tile dimensions
 
-# Kernel 1 - Hierarchical Tiling
+## Kernel 1 - Hierarchical Tiling
 The structure of Kernel 1 provides a foundation that I iterated on for the next 4 kernels. It has a 4 level hierarchical tiled structure as shown in the image below. Based on some experiments, for a single precision GEMM calculation not running on tensor cores, a 4 level tiling structure similiar to this one is sufficient to keep the compute units fully fed, and get close to cuBLAS performance. However, for a tensor core GEMM, it is only the starting point! If at this point you find yourself confused, and are interested in reading about a series of 10ish kernels that build up to a kernel like this one, I highly recommend [this](https://siboehm.com/articles/22/CUDA-MMM) article.
 
 ![tiling](/images/my_tiles_2.png)
@@ -172,19 +174,18 @@ for (block_k = 0; block_k < K; block_k += BK)
 ```
 
 This kernel (code [here](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel1.cu)) is the starting point, it does not get close to cuBLAS level performance.
-![kernel1](/images/kernel1.png)
+![table1](/images/table1.png)
 
 
-# Kernel 2 - Vectorized memory copy and loop unrolling
+## Kernel 2 - Vectorized memory copy and loop unrolling
 In order to improve the performance of our code, we need to know why it is slow. When writing CUDA kernels, the best tool to use for this is called NSight Compute, a profiler developed by NVIDIA that gives lots of detailed metrics about how a kernel is interacting with the hardware. The first place I typically look is the section called "Warp State Statistics". As a kernel is executing, each warp is being issued instructions by a scheduler. In an ideal world, the scheduler would be able to issue a new instruction each clock cycle. In the real world, it is very hard to write a kernel that can issue a new instruction every cycle, there are all sorts of reasons why on a given cycle, a warp may not be capable of executing its next instruction and will instead "stall" i.e. do nothing. The reasons for stalling can be due to capacity limits of various hardware pipelines, memory latency, or sychronization points in our kernel which require all the threads running on an SM to wait for all the other threads to catch up. The Warp State Statistics section tells us how many clock cycles the average warp spends stalled, per average instruction issued, broken down across a bunch of different categories. This gives us the information we need to target our optimizations to the least performant parts of our kernel. Here is a screenshot of what the Warp State section for Kernel 1.
 ![warp_state_kernel1](/images/warp_state_kernel1.png)
 The "Warp Cycles Per Issued Instruction" field tells us that on average for each instruction issued, warps spend about ~30 cycles idle, and the table below tells us that 16 of these 30 cycles are due to the "Long Scoreboard" stall category. 
 
-[Scoreboarding](/link/here) is an algorithm implemented in the hardware of most processors for tracking when the data dependencies for the next instruction have arrived in the registers they need to be in for the instruction to execute. Most modern CPUs are able to reorder instructions on the fly such that instructions whose operands are ready can execute ahead of instructions whose operands have yet to arrive in registers. The reordering is done in hardware, subject to constraints imposed by the data dependencies between subsequent instructions. This is called [out of order execution](/link/here) and it is a rather fancy technique for hiding memory latency. GPUs generally do not reorder instructions, I would imagine because the logic required for reordering instructions consumes a fair amount of precious transistors on the chip, and since GPUs are designed for [throughput](/link/here) these transistors are better spent on things like tensor cores.
+[Scoreboarding](https://en.wikipedia.org/wiki/Scoreboarding) is an algorithm implemented in the hardware of most processors for tracking when the data dependencies for the next instruction have arrived in the registers they need to be in for the instruction to execute. Most modern CPUs are able to reorder instructions on the fly such that instructions whose operands are ready can execute ahead of instructions whose operands have yet to arrive in registers. The reordering is done in hardware, subject to constraints imposed by the data dependencies between subsequent instructions. This is called [out of order execution](https://en.wikipedia.org/wiki/Out-of-order_execution) and it is a rather fancy technique for hiding latency. GPUs generally do not reorder instructions, I would imagine because the logic required for reordering instructions consumes a fair amount of precious transistors on the chip, and since GPUs are designed for [throughput](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#the-benefits-of-using-gpus) these transistors are better spent on things like tensor cores.
 
 GPUs do however perform scoreboarding in hardware, and when the data required to execute the next instruction has not arrived in register memory, the warp that is executing just waits for its data to arrive. The "Long Scoreboard Stall" counts the average number of cycles that warps spend stalled waiting for data to arrive from global memory. The fact that this stall reason accounts for ~50% of all the cycles that warps spend idle tells us that the performance of Kernel 1 is primarily limited by **memory latency**. This tells us we should focus on the code that is moving data from global memory onto the chip, and figure out how to minimize the latency per byte moved.
 
-#### Global Memory Reads / Shared Memory Writes
 Reading a rectangular tile of data from global memory, and writing it to shared memory is the first thing that occurs on each iteration of the outer loop of the kernel. The easiest way to do this is for adjacent threads to access adjacent values in global memory, and write data to shared memory in the same layout that it came from in global memory. This access pattern is optimal both for reading global memory, and writing shared memory. Here is the first data transfer that I wrote:
 
 ```c++
@@ -203,7 +204,7 @@ __device__ void tileMemcpy(
     // # of threads is multiple of # of columns in the tile
     assert(num_threads % tile_cols == 0);
     
-    // assign each thread a row/column in the tile, calculate the column step
+    // assign each thread a row/column in the tile, calculate the row step
     const unsigned int row_step = num_threads / tile_cols;
     const unsigned int thread_row = thread_idx / tile_cols;
     const unsigned int thread_col = thread_idx % tile_cols;
@@ -214,7 +215,7 @@ __device__ void tileMemcpy(
     }
 }
 ```
-Looking at the SASS corresponding to this `tileMemcpy` function in [godbolt](https://godbolt.org/z/1MeavE3GG), we can see that the copy operation inside the loop `dst[...] = src[...]` is actually two operations from the lower level perspective of SASS: first, a load of `sizeof(half) = 2 bytes` from global memory into a register, and then a store of 2 bytes from the register to the `dst` address. The long scoreboard stall prevents the store from taking place until the value we are loading has arrived in the register.
+Looking at the SASS corresponding to this `tileMemcpy` function in [godbolt](https://godbolt.org/z/1MeavE3GG), we can see that the copy operation inside the loop `dst[...] = src[...]` is actually two operations from the lower level perspective of SASS: first, a load of `sizeof(half) = 2 bytes` from global memory into a register, this is `LDG.U16` in SASS, and then a store of 2 bytes from the register to shared memory, this is STS.U16. The long scoreboard stall prevents the store from taking place until the value we are loading has arrived in the register.
 
 Here is a visualization of how this loop is executing, for a single thread:
 ![memory_latency](/images/memory_latency.png)
@@ -258,10 +259,23 @@ __device__ __forceinline__ void tileMemcpyUnrolled(
     
 }
 ```
+This gives us something more along the lines of:
+![memory_latency_unrolled](/images/memory_latency_unrolled.png)
+In the initial version, the total latency of the copy operation is roughly proportional to the memory latency of the device, times the number of loop iterations. After unrolling the loop, compared to the naive version, the total latency is reduced by the number of loads the compiler decides to overlap with eachother.
 
+The other fairly easy optimization we can make here is to increase the number of bytes being loaded per instruction. Our load operation is currently compiling to `LDG.U16`, each of these instructions loads 16 bits/2 bytes from DRAM. The widest load instruction in SASS is `LDG.128`, which loads 128 bits/16 bytes. Since our kernel is bound by memory latency and not memory bandwidth, if we use a wider load instruction will experience the same latency per memory request, but move more bytes per request. We are amortizing the latency over more bytes moved, which is a win for efficiency.
 
+![memory_latency_vectorized](/images/memory_latency_vectorized.png)
 
+A quick and hacky way to accomplish this is by `reinterpret_cast`ing the `src` and `dst` pointers from `half` to `float4`, and updating the index and loop calculations accordingly. Here is a [godbolt link](https://godbolt.org/z/v3T3x14ns) to a kernel with the vectorized and unrolled memory copy, and [here](https://github.com/alexarmbr/matmul-playground/blob/main/src/device_utils.cuh#L73) is the code.
 
- 
-### Resources/Citations
+These optimizations to the memcpy increase the throughput over the first kernel by about 3x. But there is still a long way to go before we approach cuBLAS level performance
+![table2](/images/table2.png)
 
+## Kernel 3 - Shared Memory Swizzling
+Back to the warp state section of NSight Compute
+![kernel2_nsight_compute](/images/kernel2_nsight_compute.png)
+The long scoreboard stall is no longer the leading offender in terms of warp stalls, and our kernel got about 3x more performant after applying the optimizations described in the last section. Warps are now spending an average of ~19 cycles stalled per issued instruction due to something called "MIO Throttling." What is MIO Throttling, and how do we address it? According to nsight compute [docs](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html) this means:
+>Warp was stalled waiting for the MIO (memory input/output) instruction queue to be not full. This stall reason is high in cases of extreme utilization of the MIO pipelines, which include special math instructions, dynamic branches, as well as shared memory instructions.
+
+In our case, this stalling is almost certainly due to shared memory instructions, since our kernel has very few dynamic branches, and no trigonometry or any other [special math](https://developer.nvidia.com/cuda-math-library) instructions. Specifically, it is due to shared memory bank conflicts. According to [here] the two main symptoms of shared memory bank conflicts are very high L1/TEX thoughput number (currently at 97% of peak) and MIO Throttle stalls.
