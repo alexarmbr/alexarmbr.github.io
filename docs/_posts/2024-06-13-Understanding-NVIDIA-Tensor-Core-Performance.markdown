@@ -12,36 +12,39 @@ categories: jekyll update
 {:toc}
 
 # Introduction
-This post details my recent efforts to write an optimized matrix multiplication kernel in CUDA using tensor cores on an NVIDIA Tesla T4 GPU. The goal is to compute $D = \alpha * A * B + \beta * C$, where $D,A,B$ and $C$ are large matrices full of half precision floating point numbers, and $\alpha$, $\beta$ are constants. This problem is usually reffered to as a **Ge**neralized **M**atrix **M**ultiply, or **GEMM** for short. My goal is to write a GEMM kernel with comparable throughput to cuBLAS's [Hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, cuBLAS is a highly optimized, closed source library of hand tuned kernels specific to each GPU architecture released by NVIDIA.
+This post details my recent efforts to write an optimized matrix multiplication kernel in CUDA using tensor cores on a NVIDIA Tesla T4 GPU. The goal is to compute $D = \alpha * A * B + \beta * C$, as fast as possible. In this equation $D,A,B$ and $C$ are large matrices full of half precision floating point numbers, and $\alpha$, $\beta$ are constants. This problem is usually refered to as a **H**alf-precision **Ge**neralized **M**atrix **M**ultiply, or **HGEMM** for short. 
 
- Tensor Cores are specialized hardware units on NVIDIA chips that implement a small matrix multiplication, with reduced precision operands in hardware. At the lowest level, they multiply two 4x4 matrices in a single clock cycle. I recently became curious about NVIDIA tensor cores after having the following two shower thoughts. First, it seems like [most](https://www.semianalysis.com/p/google-gemini-eats-the-world-gemini) generative AI training and inference these days happens on A100s and H100s. Second, all of this training and inference is almost certainly running on tensor cores, because they offer a **massive** throughput increase for matrix math compared to regular CUDA cores. From [here](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
+ Tensor Cores are specialized hardware units on NVIDIA chips that implement a small matrix multiplication, with reduced precision operands in hardware. The following two shower thoughts made curious about how tensor cores work. First, it seems like [most](https://www.semianalysis.com/i/136469751/the-gpu-rich) generative AI training and inference these days happens on A100s and H100s. Second, all of this training and inference is almost certainly running on tensor cores, because they offer a **massive** throughput increase for matrix math as compared to what you get if you dont use them. From [here](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
 >An H100 GPU has 989 TFLOPs of half-precision matrix multiply compute, and ~60 TFLOPs of “everything else”. So, every cycle the tensor core is in use, you’re getting at least 94% utilization of the hardware. And every cycle the tensor core is not in use, you’re getting no more than 6% utilization of the hardware.
 
-Given their huge importance in the world today, when I started this project it felt to me like there is disproportionately little info and dialogue on the internet about how to use them directly in CUDA. I quickly learned this lack of info is probably because if you want to write a kernel that uses tensor cores at anywhere close to their full potentional, you need to employ some fairly tricky techniques to keep them fed, which in practice means  efficiently moving bytes through the memory heirarchy of the GPU, and overlapping compute with this data movement. But as with all rewarding engineering endeavors, with a little focus and persistence I started to see the cleverness and elegance in algorithmic details which once seemed uncomfortably complicated and esoteric, which is what moved me to write this article!
+Given their huge importance in the world today, when I started this project it felt to me like there is disproportionately little info and dialogue on the internet about how to use them directly. I quickly learned this lack of dialogue on the internet is probably because writing algorithms that use them is a bit of a niche interest. The basic mechanics of how to call them are not hard, however writing a kernel that can use them at anywhere close their full potential is hard. Their huge thoughput means that in order to use them at anywhere close to their full potential, you need to move bytes though the memory hierarchy of the GPU in a maximally efficient way, and overlap the computing with this data movement. There are certain algorithmic techniques that you need to use if you want get your moneys worth from your tensor cores, this article is an exploration of these techniques. I figured out the implementation details mostly by digging around the NVIDIA [CUTLASS](https://github.com/NVIDIA/cutlass/tree/main) forums and source, and reading old GTC [slide decks](https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9593-cutensor-high-performance-tensor-operations-in-cuda-v2.pdf). I wrote this article in order to make sure I actually understand what I am doing, and also in the hope that some fellow GPU nerds trying to work with tensor cores might find it helpful.
 
-The [roofline](https://en.wikipedia.org/wiki/Roofline_model) chart below captures in a nutshell why writing a kernel which achieves peak performance with tensor cores is hard. Roofline charts plot the arithmetic throughput you can achieve on a given piece of hardware as a function of the data reuse of a particular algorithm. The x-axis corresponds to data reuse in units of FLOPs/byte, this is a property of a particular implementation of a kernel. It measures how many FLOPs are performed on each byte read from memory. The y-axis shows FLOP/sec which means at a given level of data reuse, how many floating point operations can this piece of hardware complete in a second. For each roofline, the points on the x axis to the left of the cusp correspond to levels of data reuse that result in an algorithm being "memory bound", that is the floating point throughput we can achieve is limited by how much data we can move onto the chip. The points on the x axis to the right of the cusp correspond to higher levels of data reuse that result in an algorithm being "compute bound", this means we are moving enough data onto the chip to keep our compute units fully fed, and our throughput is limited by the FLOP/s of the device, which is a huge number, rather than the memory bandwidth, which comparitively is a smaller number. In this case for the Tesla T4, the tensor cores are capable of close to $65*10^{12}$ or $65,000,000,000,000$ half precision FLOP/s, which is about 8x the throughput of CUDA cores performing single precision math. The FLOP/s number found on the spec sheet is usually conditioned with the word "theoretical" because in practice, it is physically impossible for the gpu to achieve this throughput for any sustained amount of time without melting or catching on fire, for an excellent explanation of why this is see [here](https://www.thonking.ai/p/strangely-matrix-multiplications) 
+When I started my goal was to write a kernel with comparable performance to the cuBLAS [hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, which is the closed-source, gold standard implementation released by NVIDIA. I iteratively optimized a series of 6 kernels, with the first achieving a measly 8% of the cuBLAS throughput, and the last achieving a decent 96% of the cuBLAS throughput for 8192x8192 matrices.
+
+# Background
+## The memory wall
+
+In the 70 or so years it has been since humanity started building transistor based computers, the capacity for performing arithmetic has been growing along the moores law exponential, while the capacity for moving data from where it is stored to where it is computed upon has not been growing exponentially. This problem is called the [memory wall](https://en.wikipedia.org/wiki/Random-access_memory#Memory_wall) and it is one of the central problems in computer architecture today, [especially](https://horace.io/brrr_intro.html) when it comes to deep learning workloads. What this means for us is that if we want to be able to use the ~65 trillion FLOPs per second that our tensor cores are capable of, moving the corresponding amount bytes per second from DRAM may be a challenge.
+
+## Roofline charts
+The [roofline](https://en.wikipedia.org/wiki/Roofline_model) model allows us to think about this conundrum a bit more precisely. The basic idea is that we imagine a simplified computer with a two level memory hierarchy, fast memory and slow memory. We can only perform computation on data that is resident in fast memory, at a rate of $\tau$ FLOP/sec. The slow memory has unlimited size, and it can move $\beta$ bytes/sec of data into the fast memory. 
+
+Because of the memory wall, $\tau$ is way larger than $\beta$, but since we want our algorithm to run as fast as possible we want to use all $\tau$ of available FLOP per second.
+
+
+
+
+
+
+<!-- [Roofline](https://en.wikipedia.org/wiki/Roofline_model) charts plot the arithmetic throughput you can achieve on a given piece of hardware as a function of the data reuse of a particular algorithm. The x-axis corresponds to how many FLOPs a particular kernel implementation performs on each byte read from memory, this metric is called data reuse and is in units of FLOP/byte. The y-axis corresponds to FLOP/sec, which is a measure of arithmetic thoughput. The roofline on the graph plots the upper bound on arithmetic thoughput, as a function of data reuse. This plot 
+
+For each roofline, the points on the x axis to the left of the cusp correspond to levels of data reuse that result in an algorithm being "memory bound", that is the floating point throughput we can achieve is limited by how much data we can move onto the chip. The points on the x axis to the right of the cusp correspond to higher levels of data reuse that result in an algorithm being "compute bound", this means we are moving enough data onto the chip to keep our compute units fully fed, and our throughput is limited by the FLOP/s of the device, which is a huge number, rather than the memory bandwidth, which comparitively is a smaller number. In this case for the Tesla T4, the tensor cores are capable of close to $65*10^{12}$ or $65,000,000,000,000$ half precision FLOP/s, which is about 8x the throughput of CUDA cores performing single precision math. The FLOP/s number found on the spec sheet is usually conditioned with the word "theoretical" because in practice, it is physically impossible for the gpu to achieve this throughput for any sustained amount of time without melting or catching on fire, for an excellent explanation of why this is see [here](https://www.thonking.ai/p/strangely-matrix-multiplications) 
 ![roofline](/images/roofline1.png)
-
-
 
 From the perspective of algorithm design, this huge increase in throughput of tensor cores is something of a blessing and a curse. The blessing is that tensor cores are powerful, their theoretical max throughput is 8x that of CUDA cores. The tricky part is that in order to reach peak performance with tensor cores, according to the simplified view of this roofline model we need to write an algorithm that has about 8x more data reuse than an algorithm which achieves peak single precision performance.
 
-In practice, there are lots of details this chart does not capture. It simplifies the memory heirarchy of a GPU down to 2 storage types, one large and slow and the other small and instantaneous. Also, the throughput of our kernel is not only a function of data reuse, the other major factor is the level of concurrency we can achieve between data transfer and compute. All models are wrong, but some are useful, and I find that looking at this chart gives me intuition about why this project is so f***ing hard!
+In practice, there are lots of details this chart does not capture. It simplifies the memory heirarchy of a GPU down to 2 storage types, one large and slow and the other small and instantaneous. Also, the throughput of our kernel is not only a function of data reuse, the other major factor is the level of concurrency we can achieve between data transfer and compute. All models are wrong, but some are useful, and I find that looking at this chart gives me intuition about why this project is so f***ing hard! -->
 
-I was inspired to work on this after reading [this](https://siboehm.com/articles/22/CUDA-MMM) excellent article in which the author takes on the same endeavor, but for single precision math. I naively thought something along the lines of "I'll just write something similiar to kernel 10 from Simon's article, swap in some inlined PTX to call tensor cores inside the inner loop, and call it a day!" This turned out to be incorrect, the kernels discussed in this article start from a similiar place to where Simon's article ends. I am trying to make this article as self contained as possible, which necessarily means it is a bit long and meandearing but if you are really interested in this I would highly recommend reading that one first.
-
-# Background
-## How to write a fast matrix multiplication, chapter 0
-If you are interested in hardware accelerated linear algebra, one of the coolest and most innovative projects happening right now is called NVIDIA [CUTLASS](https://github.com/NVIDIA/cutlass). In their words:
->CUTLASS is a collection of CUDA C++ template abstractions for implementing high-performance matrix-matrix multiplication (GEMM) and related computations at all levels and scales within CUDA.
-
-It provides a set of modular and composable building blocks that provide abstractions over some of the finicky lower level details that are essential for performance if you are trying to write fast matmul-like kernels. The abstractions provided by CUTLASS also make it easier to achieve both performance and portability across a range of GPU architectures, which is helpful because there is usually a tradeoff between these two aims. At the top of their README, and at the beggining of almost every CUTLASS slide deck, you usually see something that looks like [this](https://github.com/NVIDIA/cutlass/blob/main/media/images/gemm-hierarchy-with-epilogue-no-labels.png)
-![gemm_hierarchy.png](/images/gemm-hierarchy.png)
-This is a visualization of algorithmic technique called hierarchical tiling, it is the current paradigm for writing performant number crunching algorithms on computers with multi-level memory hierarchies (which is pretty much every non-embedded computer we have today). I will come back to this image in a bit, but in order to build some intuition about what hierarchical tiling is and why we use it, I think it is helpful to go through an example of how being conscious of our computer's memory heirarchy can speed up a matrix multiplication.
-
-## How to not be memory bound (simple memory hierarchy)
-
-In the 70 or so years it has been since humanity started building transistor based computers, the capacity for performing arithmetic has been growing along the moores law exponential, while the capacity for moving data from where it is stored to where it is computed upon has not been growing exponentially. This problem is called the [memory wall](https://en.wikipedia.org/wiki/Random-access_memory#Memory_wall) and it is one of the central problems in computer architecture today, especially for the heavy number crunching sorts of workloads that are required for running neural networks.
 
 The two dotted lines in the roofline plot above show the "balance point" for CUDA cores (blue) and for tensor cores (red). The balance point is a property of the hardware, it tells us the level of data reuse an algorithm must achieve if want our throughput to be limited by our processors capacity for arithmetic which is a very big number, rather than memory bandwidth which comparitively is a smaller number. Data reuse (also sometimes known as arithmetic intensity) is measured in terms of $\frac{FLOPs}{byte}$, that is how many FLOPs we perform on each byte read from memory. The higher the data reuse, the better chance we have at getting full utilization from our compute cores, as opposed to having them spend idle time waiting for data to arrive from memory.
 
@@ -113,6 +116,7 @@ For the rest of this article I will discuss a series of 5 kernels that got me to
 1. [hierarchical tiling](#kernel-1---hierarchical-tiling)
 2. [vectorized/unrolled gmem->smem transfer](#kernel-2---vectorized-memory-copy-and-loop-unrolling)
 3. [shared memory swizzling](#swizzling)
+4. [makeshift async copy](#kernel-4---makeshift-async-copy)
 
 
 ## Kernel 1 - Hierarchical Tiling
@@ -313,7 +317,7 @@ This is a common situation in kernels that use 2d shared memory tiles, and the s
 ![simple_smem_padding](/images/simple_smem_padding.png)
 Array elements are color coded by column. Notice that in the no padding case, all the array elements in a given column fall into the same memory bank. After adding the column of padding, the array elements in a given column are spread across all 4 memory banks. The padding technique could be used here to fully eliminate bank conflicts. Since we are using [vectorized](#kernel-2---vectorized-memory-copy-and-loop-unrolling) writes to shared memory, we are writing to shared memory in 16 byte chunks at a time, and each chunk must be [aligned](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#device-memory-accesses). Adding 16 bytes of padding to each row of shared memory would result in each 8x8 mma tile being spread across all 32 memory banks (exercise of convincing yourself of this left to reader). 
 
-The drawback of using the padding technique is that it requires us to allocate extra, unused space in shared memory. In Kernel 2, the shared memory tile for $A$ is 256x64, and the shared memory tile for $B$ is 128x64. If we add an extra 16 byte, or 8 element column to both of these, that will increase the amount of shared memory we allocate by 25%, for a total of increase of 6144 bytes. Shared memory is precious stuff; the moral of the [background](#background) section is that if we want to get full utilization from our compute units, we need a sufficiently high ratio of data reuse, and the maximum amount of data reuse on a given piece of hardware is limited by amount of fast memory on that piece of hardware. Since we are trying to squeeze every last drop of performance out of this GEMM kernel, we should wonder whether there is a way to elminate bank conflicts without wasting any shared memory space. It turns out this is very possible!
+The drawback of using the padding technique is that it requires us to allocate extra, unused space in shared memory. In Kernel 2, the shared memory tile for $A$ is 256x64, and the shared memory tile for $B$ is 128x64. If we add an extra 16 byte, or 8 element column to both of these, that will increase the amount of shared memory we allocate by 25%, for a total of increase of 6144 bytes. This wasted space turns out to be a significant drawback, when writing a high performance kernel shared memory is very precious stuff - this becomes especially apparent later down in the road when using a technique called double buffering, each threadblock in future kernels will end up using 100% of the 65536 bytes of shared memory on each SM. So, we should wonder whether there is a way to eliminate bank conflicts without wasting any shared memory space. It turns out this is very possible!
 
 ### Swizzling (toy example)
 Swizzling is probably my favorite technique that I learned in the process of working on this. The word "swizzle" has several different uses, when used in the context of cocktails it means to [stir](https://en.wikipedia.org/wiki/Swizzle_stick) and when used in the context of GPUs it means to [rearrange](https://en.wikipedia.org/wiki/Swizzling_(computer_graphics)). In our context of eliminating shared memory bank conflicts in 2D tiles of data, swizzling means permuting the elements within a tile of shared memory such that we can access the data without any bank conflicts. This is one of those techniques that seemed like black magic to me until I took the time to understand it, and now I appreciate its cleverness and elegance.
@@ -361,4 +365,85 @@ Some notes about what our swizzling function should do and not do:
 
 So what this all means is that for each index, we want to take the blue bits, XOR them with the green bits, and replace the original blue bits with the result of this XOR. If `i` is the index we want to swizzle, this works out to:
 ![swizzled_vs_unswizzled](/images/swizzled_vs_unswizzled.png)
-And just like that, we have no bank conflicts. Swizzling takes a bit of figuring out, but if you are the type of person who likes figuring stuff out, it is undoubtedly the best way to fix shared memory bank conflicts. I think its very elegant and clever, if you compare kernel2 with kernel3, there is a total of ~4 lines of code that change, these four lines are the addition of the swizzle into the shared memory index calculation.
+And just like that, we have no bank conflicts. Swizzling takes a bit more figuring out than the padding technique, the choice of swizzle function depends on the shared memory array dimensions, and the vector width we are using for reads/writes (i.e. `float4`, `float2`, `int`, e.t.c.). As a result, if we use swizzling it adds an extra consideration each time we consider changing either of these. But if you want to eliminate bank conflicts and dont want to increase your shared memory footprint in the process, swizzling becomes necessary. I think it is very elegant and clever, if you compare kernel 2 with kernel 3, there is a total of ~4 lines of code that change, these four lines are the addition of the swizzle into the shared memory index calculation.
+
+I figured all this out by looking at the `Swizzle` class implemented [here](https://github.com/NVIDIA/cutlass/blob/main/python/pycute/swizzle.py) in the CUTLASS repository. Via its three parameters, `bits`, `base`, and `shift`, this class represents a family of swizzle functions that shift and XOR bits of array indices. I have also seen examples of more exotic swizzle functions (see slide 27 [here](https://developer.download.nvidia.com/video/gputechconf/gtc/2019/presentation/s9593-cutensor-high-performance-tensor-operations-in-cuda-v2.pdf)) that go beyond what is representable by the implementation in CUTLASS. I found it helpful to visualize the permutations applied by different swizzle functions, to help with this I wrote a bit of python [code](https://github.com/alexarmbr/matmul-playground/blob/main/scripts/shmem_layout_viz.py) that pretty-prints arrays, applies swizzle functions, and counts bank conflicts.
+
+Eliminating bank conflicts results in a ~2x speedup, starting to get us in the neighborhood of the fastest CUTLASS GEMM kernel, but still a ways away from cuBLAS performance
+![table3](/images/table3.png)
+
+## Kernel 4 - Makeshift Async Copy
+Each optimization addresses the least performant part of the previoius kernel. After applying each optimization, if it worked, the least performant part of the kernel should change. Before fixing the shared memory bank conflicts, the shared memory operations inside the inner loop were the bottleneck. After eliminating bank conflicts, the inner loop becomes much more efficient, and the bottleneck is once again the latency of the global memory to shared memory transfer. This was addressed with vectorizing and loop unrolling in [Kernel 2](#kernel-2---vectorized-memory-copy-and-loop-unrolling), but after fixing bank conflicts, NSight Compute is telling us that there is more latency here to hide. Here is pseudocode of the current loop nests, with a zoomed in view of the code that needs to be improved:
+![long_scoreboard_stall_kernel3](/images/long_scoreboard_stall_kernel3.png)
+Once again the issue is that the line which performs the global memory to shared memory copy: 
+
+```c++
+dst_float4[dst_index] = src_float4[src_index];
+// shared memory        // global memory
+```
+
+ This^ is a blocking operation from the perspective of hardware, in the sense that when a given thread executes the resulting assembly the thread will be stalled for the full duration of to data arriving from global memory. The above line is equivalent to this:
+
+```c++
+float4 tmp = src_float4[src_index]; // global memory to register
+dst_float4[dst_index] =  tmp; // register to shared memory
+```
+The global memory to register transfer, which is the first line, incurs latency because data is coming from off chip. When it comes time to store from register to shared memory (second line) the hardware detects that the data needed from global memory has not yet arrived in `tmp`, and execution stalls until it arrives. In [Kernel 2](#kernel-2---vectorized-memory-copy-and-loop-unrolling) we addressed this performance issue by amortizing the latency over more data moved per transaction (vectorizing) and helping the compiler to interleave multiple loads/stores, which hides latency (loop unrolling). But NSight Compute tells us that even after these optimizations, this sort of stall, on this line specifically, accounts for about ~20% of the total clock cycles that the kernel spends stalled.
+
+The key observation here is that if we break down the `dst[...] = src[...]` line into its two constituent parts, we can break them apart so that other useful work is being done while the data is in flight from global memory.
+The general idea is that we can prefetch data from global memory into register storage, one `block_k` ahead of the `block_k` we are currently computing on. At a very high level we want to go from this:
+```c++
+float4 tmp = src_float4[src_index]; // global memory to register
+dst_float4[dst_index] =  tmp; // register to shared memory
+{
+    // compute inner loop for current block tile
+}
+```
+
+to this:
+```c++
+float4 tmp = src_float4[src_index]; // global memory to register
+{
+    // compute inner loop for previous block tile
+}
+dst_float4[dst_index] =  tmp; // register to shared memory
+```
+
+Here is a visualization of what this looks like at the block tile level. The key improvement being made here is that the slow transfer from global memory is now being overlapped with the compute inner loop. 
+
+![prefetch_viz](/images/prefetch_viz.png)
+
+
+This improved overlapping of data movement and compute is accomplished by
+- adding new register storage to hold the data that is prefetched from global memory
+- breaking up the global to shared memory transfer into its two components, putting these two components on opposite sides of the inner loop (over warp tiles and mma tiles)
+- and tweaking the position of the two `__syncthreads()` in the outer loop to allow for the concurrency we want, while still preventing race conditions.
+
+Here is before/after pseudocode which shows how the data movement changes.
+![prefetch](/images/prefetch.png)
+
+This produces a nice speedup over the previous kernel, and gets us to performance that is on par with the fastest CUTLASS hgemm kernel.
+
+![table4](/images/table4.png)
+
+### GPU occupancy (digression)
+The potential cost of this optimization is that it requires additional register storage, each thread block stores two additional block tiles worth of data in register memory. According to the Launch Statistics section in NSight Compute, we go from using 104 registers per thread in Kernel 3, to 166 registers per thread in Kernel 4. This increase resource usage per thread has the *potential* to hurt kernel performance because it can impact how many threads the hardware is capable of executing concurrently. This is a quick digression on why increasing register use per thread has the potential to hurt performance, but why in this case, it doesn't.
+
+This gets to a topic called **occupancy** which is central to the CUDA hardware implementation. Each streaming multiprocessor (SM) will maintain block, warp, and thread execution state (shared memory, registers, program counter) on chip, for as many thread blocks as can be fit. The amount of thread blocks that can be fit on an SM depends on:
+1. how much shared memory, registers per thread, and number of threads each thread block needs to execute (this a property of a given kernel, and the launch configuration of that kernel)
+2. how much shared memory, registers per thread, and number of threads the SM can handle at once (this is a property the device, and improves from generation to genereation)
+
+If a given kernel implementation and launch configuration require only a small number of registers, a few threads, and a small amount of shared memory, an SM can execute lots of thread blocks concurrently. When multiple thread blocks are executing concurrently on an SM, context switching between them is free. This allows the hardware to hide stalls and latency simply by tracking which threads are capable of executing their next instruction and which are not, and issuing instructions for whichever threads are ready. The more threads the SM has to choose from, the better this works. This is called [hardware multithreading](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#hardware-multithreading), and lots of older resources on CUDA performance talk about it as the primary guiding principle for writing fast kernels.
+
+However, this kernel (and many other kernels) require lots of registers per thread, which limits the number of thread blocks that can be resident on the SM at once, which in turn limits the hardwares ability to hide stalls automatically by context switching. Why do we need so many registers?
+- [This](#how-to-not-be-memory-bound-simple-memory-hierarchy) part of the background section goes through how a regular matrix multiplication requires $O(n^3)$ compute, but operates on only $O(n^2)$ data. 
+
+### Async Copy on Ampere Architecture (digression)
+Ampere arch has a hardware instruction for moving data directly and asynchronously from global memory to shared memory, without going through a register.
+
+## Kernel 5 - Tune Block Tile Dimensions
+Kernel 5 achieved ~35 TFLOP/s, which is on par with the fastest CUTLASS HGEMM kernel that I found, but still only achieves about ~62% of the ~51 TFLOP/s throughput of the cuBLAS HGEMM implementation. At this point I thought "darn, my goal was 100% of the cuBLAS throughput, and I have used a good number of performance tricks but I am only at 62%. Where should I focus the rest of my efforts?"
+
+One of the primary challenges when working on kernels such as this one is the (global) memory wall, that is the imbalance betweeen the high throughput of the tensor cores, and comparatively low global memory bandwidth. At this point I became curious, am I still memory bound?
+
+## Kernel 6 - Double Buffering
