@@ -15,12 +15,19 @@ categories: jekyll update
 # Introduction
 This post details my recent efforts to write an optimized matrix multiplication kernel in CUDA using tensor cores on a NVIDIA Tesla T4 GPU. The goal is to compute $D = \alpha * A * B + \beta * C$, as fast as possible. In this equation $D,A,B$ and $C$ are large matrices full of half precision floating point numbers, and $\alpha$, $\beta$ are constants. This problem is usually referred to as a **H**alf-precision **Ge**neralized **M**atrix **M**ultiply, or **HGEMM** for short. 
 
- Tensor Cores are specialized hardware units on NVIDIA chips that implement a small matrix multiplication in hardware. I recently became interested in tensor cores for two reasons. First, it seems like [most](https://www.semianalysis.com/i/136469751/the-gpu-rich) generative AI training and inference these days happens on A100s and H100s. Second, all of this training and inference is almost certainly running on tensor cores, because they offer a massive throughput increase for matrix math as compared to what you get if you dont use them. From [here](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
+ Tensor Cores are specialized hardware units on NVIDIA chips that implement a small matrix multiplication in hardware. I recently became interested in tensor cores for two reasons. First, it seems like [most](https://www.semianalysis.com/i/136469751/the-gpu-rich) generative AI training and inference these days happens on A100s and H100s. Second, all of this training and inference is almost certainly running on the tensor cores of these devices, because they offer a massive throughput increase for matrix math as compared to what you get if you dont use them. From [here](https://hazyresearch.stanford.edu/blog/2024-05-12-tk)
 >An H100 GPU has 989 TFLOPs of half-precision matrix multiply compute, and ~60 TFLOPs of “everything else”. So, every cycle the tensor core is in use, you’re getting at least 94% utilization of the hardware. And every cycle the tensor core is not in use, you’re getting no more than 6% utilization of the hardware.
 
-Given their huge importance in the world today, when I started this project it felt to me like there is disproportionately little info and dialogue on the internet about how to use them directly. I quickly learned this lack of dialogue on the internet is probably because writing algorithms that use them is a bit of a niche interest. The basic mechanics of how to call them are not hard, however writing a kernel that can use them at anywhere close their full potential *is* hard. Their huge throughput means that in order to use them at anywhere close to their full potential, you need to move bytes though the memory hierarchy of the GPU in a maximally efficient way, and overlap the computing with this data movement. There are certain algorithmic techniques that you need to use if you want get your moneys worth from your tensor cores, this article is an exploration of these techniques. I figured out the implementation details mostly by digging around the NVIDIA [CUTLASS](https://github.com/NVIDIA/cutlass/tree/main) forums and source, and I wrote this article in order to make sure I actually understand what I am doing, and also in the hope that some fellow GPU nerds trying to work with tensor cores might find it helpful.
+Given their huge importance in the world today, when I started this project it felt to me like there is disproportionately little info and dialogue on the internet about how to use them directly. I quickly learned this lack of dialogue on the internet is probably because writing algorithms that use them is a bit of a niche interest. The basic mechanics of how to call them are not hard, however writing a kernel that can use them at anywhere close their full potential *is* hard. Their huge throughput means that in order to use them at anywhere close to their full potential, you need to move bytes though the memory hierarchy of the GPU in a maximally efficient way, and overlap the computing with this data movement. There are certain algorithmic techniques that you need to use if you want get your moneys worth from your tensor cores, this article is an exploration of these techniques. 
 
-When I started my goal was to write a kernel with comparable performance to the cuBLAS [hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, which is the closed-source, gold standard implementation released by NVIDIA. I iteratively optimized a series of 6 kernels, with the first achieving a measly 8% of the cuBLAS throughput, and the last achieving a decent 96% of the cuBLAS throughput for 8192x8192 matrices.
+I figured out the implementation details mostly by digging around the NVIDIA [CUTLASS](https://github.com/NVIDIA/cutlass/tree/main) forums and source, and I wrote this article in order to make sure I actually understand what I am doing, and also in the hope that some fellow GPU nerds trying to work with tensor cores might find it helpful. It should be noted that this whole project was done on a Turing architecture GPU, which was state of the art in 2018. None of the performance issues discussed here are architecture specific, but some of the strategies used to optimize performance are. One interesting thing I noticed while working on this is that the Hopper architecture has dedicated hardware support that directly addresses some of the performance issues and bottlenecks that I ran into along the way when optimizing for an older GPU. So more modern GPUs justify their increased price tag not only with increased floating point throughput, but also with features that ease the cognitive burden on programmers who are trying to optimize kernels for them.
+
+When I started my goal was to write a kernel with comparable performance to the cuBLAS [hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, which is the closed-source, gold standard implementation released by NVIDIA. I iteratively optimized a series of 6 kernels, with the [first](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel1.cu) achieving a measly 8% of the cuBLAS throughput, and the [last](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel6.cu) achieving a decent 96% of the cuBLAS throughput for 8192x8192 matrices.
+
+This article contains a background section that explains some theory that is helpful to have in your head when thinking about how to optimize kernels that operate on matrices. The rest of the article explains six algorithmic techniques that I used to make my kernel run as fast as possible.
+
+Here is a table with the performance comparison of all of the kernels:
+![table6](/images/table6.png)
 
 # Background
 ## The memory wall
@@ -81,8 +88,6 @@ Global memory has a balance point of 224, this means that if all of our memory a
 
 Shared memory is used as an explicitly managed cache that will hold small portions of the input matrices local to a particular SM (a SM is kind of analogous to a single CPU core). Within the SM, threads will load their own local portion of the problem from shared memory into register memory, which is where data must reside in order for it to be computed upon. When shared memory is operating at full bandwidth, its balance point with respect to the tensor core is 13, which means we need to cache enough data in registers to perform 13 FLOPs for each byte read from shared memory. It turns out that each SM has enough register memory to make this easily achievable. When we are optimizing this part of the algorithm, the challenge will be to enable shared memory to operate at full bandwidth, which in practice means organizing the data layout in such a way that we can read it and write it without bank conflicts. Once shared memory is at full bandwidth, sufficient arithmetic intensity will be easy to achieve. I think the shared memory balance point of 13 is worth noting though, because it tells us that shared memory alone is not fast enough to achieve peak tensor core throughput. The moral of this story is that we need registers.
 
-<!-- #### digression on registers
-Registers are the fastest and highest bandwidth level of the memory hierarchy, and consequently the most precious hardware resource for an algorithm designer. When talking about the memory hierarchy we generally assume that faster means smaller, however this is not the case when comparing registers with shared memory. The [Turing generation](https://docs.nvidia.com/cuda/turing-tuning-guide/index.html) SM has 64KiB of shared memory, and 256KiB of registers. [Ampere](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html#nvidia-ampere-gpu-architecture-tuning) and [Hopper](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html) SMs also have more register memory than shared memory, although the gap is smaller. An interesting thought experiment: given that shared memory is smaller and slower than register memory why do we use it at all? Put differently, if we were to write a GEMM kernel without using shared memory, why might it be harder than if we do use shared memory? This question got me thinking about how the tradeoff between different types of memory is more than just size vs. speed. -->
 
 ## Theoretical arithmetic intensity
 So modern computers generally have an imbalance between their arithmetic throughput and their memory bandwidth, consequently kernels that perform lots of arithmetic relative to data movement make better use of the hardware. At this point we need to think about the algorithm we are running, and forget about hardware for a moment.
@@ -192,7 +197,7 @@ If we are computing a matrix multiplication $C=A*B$, we can divide the output ma
 The above diagram shows a coarse, high level view of what a GPU implementation of hierarchical tiling looks like. When implementing this in CUDA for an NVIDIA GPU, there are some finer details we need to fill in. This tiling structure is created by:
 - a series of global, shared, and register memory allocations of fixed dimension
 - nested loops which control the positions of the tiles
-- synchronization points between threads running on each multiprocessor
+- synchronization points between threads running within a multiprocessor
 - compute at the lowest level, which in this case is a small matrix multiplication that runs on the tensor core
 
 This kernel was my starting point, but if you are interested in reading about a series of 10 kernels which build up to one like this, I recommend reading [this](https://siboehm.com/articles/22/CUDA-MMM).
@@ -230,33 +235,14 @@ The roofline model gives us an upper bound on arithmetic throughput $T_{max}=min
 As illustrated above our initial loop structure has some inefficiencies in this regard.
 
 #### Maximizing memory bandwidth
-According to [unofficial benchmarks](https://arxiv.org/pdf/1903.07486) the best achievable global memory bandwidth on the T4 is ~220 GB/sec, and the best achievable shared memory bandwidth is ~3662 GB/sec. However, an unoptimized kernel will only achieve a fraction of these numbers. The first consideration is access pattern; when groups of adjacent threads are requesting memory, some mappings of threads to data in memory are more efficient than others. The hardware that implements global memory vs. shared memory functions differently, consequently an access pattern that is optimal for reading shared memory may not be optimal for reading global memory. Global memory is discussed here, shared memory is the subject of a later chapter.
+According to [unofficial benchmarks](https://arxiv.org/pdf/1903.07486) the best achievable global memory bandwidth on the T4 is ~220 GB/sec, and the best achievable shared memory bandwidth is ~3662 GB/sec. However, an unoptimized kernel will only achieve a fraction of these numbers. The first consideration is access pattern; when groups of adjacent threads are requesting memory, some mappings of threads to data in memory are more efficient than others. The hardware that implements global memory vs. shared memory functions differently, consequently an access pattern that is optimal for reading shared memory may not be optimal for reading global memory.
 
-NVIDIA streaming multiprocessors execute threads in groups of 32, this group of 32 threads that execute together are called a **warp**. Global memory can only be accessed in aligned and contiguous chunks of 32, 64, or 128 bytes. Aligned here means that the first address of the chunk is a multiple of the size of the chunk. When the 32 threads in a warp make a memory request, the hardware looks at the 32 memory addresses requested, translates them into 32, 64, or 128 byte aligned chunks, which are then provided by the hardware. So in order for memory bandwidth to be maximized, the 32 threads in a warp must request bytes that fit evenly into 32, 64, or 128 byte. (more on this [here](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses))
-![memory_coalescing](/images/memory_coalescing.png)
+The main consideration for global memory access is called coalescing, the one sentence summary is that maximum global memory bandwidth is achieved when adjacent threads access adjacent data in global memory (explained [here](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses)). Shared memory is dove into in a [later](#background-bank-conflicts-and-wavefronts) chapter.
 
+### How to use Tensor Cores
+This section is a brief overview of the mechanics of using tensor cores.
 
-
-
-
-
-<!-- - the compute is happening at the bottom level of this hierarchy
-- arithmetic intensity matters with respect to global memory, not shared memory
-
-performance considerations: 
-- access memory in a pattern that maximizes bandwidth
-- achieving the upper bound in the roofline model requires perfect overlap between compute and data movement. Latency hiding -->
-
-
-<!--
-
-## How to use Tensor Cores
-
-Part of why GPUs are good for things like matrix multiplication is that instructions are issued to 32 threads at a time, this can be extremely efficient because the overhead of instruction issue is amortized across 32 threads (as opposed to 1 for a CPU). However, the 32 threads in a warp are still somewhat [independent](https://developer.nvidia.com/blog/inside-volta/#independent_thread_scheduling). On modern architectures (Volta and later), each thread has its own program counter and call stack, allowing each thread to take its own execution path, although on a given clock cycle the SM partition can be executing no more than one instruction per warp. [Predication](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#control-flow-instructions) is used to mark threads as inactive/active for a given instruction, which for example allows threads within a warp to diverge on a branch based on data in thread local registers.
-
-[but tensor cores are warp level instructions, all threads in a warp do the same thing]
-
-All tensor core operations are performed at the warp level in the compute hierarchy; 32 threads collaboratively load data into their registers and then sychronously execute a small hardware accelerated matrix multiply. When thinking about tensor core algorithms, we should think of the warp as an atomic element of compute, even though in reality a warp contains 32 threads capable of doing their own thing. If we were writing a tensor core free GEMM kernel, threads would be our atomic compute elements. 
+All tensor core operations are performed at the warp level in the compute hierarchy; 32 threads collaboratively load data into their registers and then synchronously execute a small hardware accelerated matrix multiply. When thinking about tensor core algorithms, we should think of the warp as an atomic element of compute, even though in reality a warp contains 32 threads capable of doing their own thing. By comparison if we were writing GEMM kernel without tensor cores, individual threads performing scalar multiply accumulate operations would be our atomic element of compute.
 
 Tensor cores are accessible via two different methods. The first is via the `wmma` [api](https://docs.nvidia.com/cuda/cuda-c-programming-guide/#wmma-description) which is part of the CUDA toolkit. `wmma` seems to be regarded as the more portable and less performant way to program tensor cores. I gave up on it pretty quickly, as it abstracts away the loading of input data from shared memory into register memory, and it turns out there are some details here which are critical for performance.
 
@@ -264,7 +250,7 @@ The other route is to use the `mma` family of instructions which are part of PTX
 
 The PTX instruction I used is `mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16` (documentation [here](https://docs.nvidia.com/cuda/parallel-thread-execution/#matrix-fragments-for-mma-m16n8k8)), each part of this instruction means something:
 * `mma`: we are performing a matrix multiply accumulate operation
-* `sync`: this instruction is sychronous, all 32 threads will wait until all 32 threads are done before resuming execution
+* `sync`: this instruction is synchronous, all 32 threads will wait until all 32 threads are done before resuming execution
 * `aligned`: all 32 threads in a warp must execute this instruction, if less than 32 threads in a warp were to execute this instruction, behavior is undefined
 * `m16n8k8`: this is the identifier for the matrix fragment shape. This means the fragment of matrix 
 $A$ has shape (16,8), the fragment of $B$ has shape (8,8), the fragments of $D$ and $C$ have shape (8,8). (Remember, the formula for a GEMM is $D = \alpha * A * B + \beta * C$). If you look at the PTX documentation linked above, there are lots of different shapes to choose from, however the Turing/Volta architectures only support a limited number. Ampere supports more, and Hopper supports even more.
@@ -283,24 +269,24 @@ These diagrams are describing a mapping between threads, registers, and matrix e
 * `a0, a1, a2, ... b0, b1, b2, ... c0, c1, c2` refer to registers that hold matrix elements.
 * The position of each thread/register pair tells us which matrix elements go in which registers of which thread. For example, `T0: {a0,a1}` is at the top left corner of matrix fragment A, this means elements `(0,0)` and `(0,1)` in this fragment are placed in registers `a0` and `a1` of thread 0.
 
-Luckily there is another PTX instruction called `ldmatrix` (docs [here](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-load-instruction-ldmatrix)) which can efficiently load data from shared memory, and shuffle matrix elements within a warp in order to create this layout for us. It can optionally transpose matrix elements as it moves them from shared memory to register, which is convenient for matrix B above, which is in a column major, or "transposed" layout.
+Luckily there is another PTX instruction called `ldmatrix` (docs [here](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-load-instruction-ldmatrix)) which loads a rectangular tile of data from shared memory, and shuffle matrix elements within a warp in order to create this layout for us. It can optionally transpose matrix elements as it moves them from shared memory to register, which is convenient for matrix B above, which is in a column major, or "transposed" layout.
 
-#### (digression)
-Given how many people and companies these days are buying NVIDIA GPUs almost exclusively for the purpose of running matrix multiplications, it seems like lots of work goes into improving the tensor cores in terms of programmability and performance between successive architectures. On one hand, the tensor core throughput goes up by an order of magnitude with each new SM architecture. On the other hand, this means that in order to make this increased throughput actually usable (rather than theoretical), new hardware support is required for keeping them fed. For example, Ampere introduced hardware support for [asychronous data copying](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html#asynchronous-data-copy-from-global-memory-to-shared-memory) from global memory to shared memory (more on this later). Hopper introduced something even fancier called the Tensor Memory Accelerator or [TMA](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator), this is a dedicated piece of hardware that is purpose built for feeding tensor cores, it can perform index calculation and initiate data copies asychronously with respect to the rest of the SM. Hopper is kind of a new and different beast, if you look at GEMM kernels in CUTLASS that target Hopper the code has a different stucture than all of the other pre `sm_90` kernels. Hopper kernels use a producer/consumer pattern, where a relatively small number of producer threads are initiating asynchronous data copies with the TMA, and then consumer threads are managing the tensor cores. I have never worked on kernels targetting Hopper so I dont know much about this at the moment, [this](https://hazyresearch.stanford.edu/blog/2024-05-12-tk) article provides an interesting overview of the user experience of writing kernels for Hopper.
+The inner loop our our kernels will consist of repeatedly calling `ldmatrix` to move data from shared memory into register memory, and then repeatedly calling the `m16n8k8` variation of `mma.sync` in order to multiply tiles together with the tensor core. For this project I used a Turing architecture GPU, on Ampere the tensor core API is very similar, but with more matrix shapes supported. On Hopper, the API is expanded substantially, PTX instructions are introduced that allow a group of 128 threads to asynchronously execute a much larger matrix multiplication than `m16n8k8`. 
 
-This is all to say that the kernels discussed here target the Turing architecture, which was SOTA in 2018, and if you are writing kernels targeting Ampere or Hopper, the techniques you employ for latency hiding will be different and easier. I used the Tesla T4 GPU because you can rent them on AWS for ~50 cents/hour, which is about as much money as I want to spend on EC2 instances. Using an older GPU was a blessing and a curse for this project, the curse was that no special hardware support was available for hiding memory latency, the blessing was that I had to use more old school techniques for hiding this latency, which gave me an appreciation for why this hardware support exists now! -->
 
 # Kernels
 
-For the rest of this article I will discuss a series of 5 kernels that got me to ~80% of cublas level performance on a tensor core GEMM. Each kernel builds on the previous one, and the themes of each are:
+For the rest of this article I will discuss a series of kernels that got me to ~96% of cuBLAS level performance on a tensor core GEMM, for 8192x8192 matrices. Each kernel builds on the previous one, and the themes of each are:
 1. [hierarchical tiling](#kernel-1---hierarchical-tiling)
 2. [vectorized/unrolled gmem->smem transfer](#kernel-2---vectorized-memory-copy-and-loop-unrolling)
 3. [shared memory swizzling](#swizzling)
 4. [makeshift async copy](#kernel-4---makeshift-async-copy)
-
+5. [tune tile dimensions](#tune-tile-dimensions)
+6. [optimized index calculation](#kernel-5---optimize-index-calculation)
+7. [double buffering](#kernel-6---double-buffering)
 
 ## Kernel 1 - Hierarchical Tiling
-The first kernel I wrote is an implementation of the hierarchical tiling structure explained above. This loop performs the matrix multiplication
+The first kernel I wrote is an implementation of the hierarchical tiling structure shown [above](#hierarchical-tiling-real-gpu). Here is pseudocode for the loop structure that performs the matrix multiplication.
 
 ```c++
 // outer loop over block tiles
@@ -310,7 +296,7 @@ for (block_k = 0; block_k < K; block_k += BK)
     A_smem[:,:] = A_gmem[block_m:block_m+BM, block_k:block_k+BK]
     B_smem[:,:] = B_gmem[block_k:block_k+BK, block_n:block_n+BN]
     
-    // sychronize across the thread block
+    // synchronize across the thread block
     __syncthreads();
 
     for (warp_k = 0; warp_k < BK; warp_k += WK)
@@ -339,13 +325,13 @@ for (block_k = 0; block_k < K; block_k += BK)
 
 }
 ```
-The 8% of cublas throughput it achieves is the starting point.
+The 8% of cublas throughput it achieves is the starting point. The rest of this article delves into some techniques I used to make it faster.
 
 ![table1](/images/table1.png)
 
 
 ## Kernel 2 - Vectorized memory copy and loop unrolling
-In order to improve the performance of our code, we need to know why it is slow. When writing CUDA kernels, the best tool to use for this is called NSight Compute, a profiler developed by NVIDIA that gives lots of detailed metrics about how a kernel is interacting with the hardware. The first place I typically look is the section called "Warp State Statistics". As a kernel is executing, each warp is being issued instructions by a scheduler. In an ideal world, the scheduler would be able to issue a new instruction each clock cycle. In the real world, it is very hard to write a kernel that can issue a new instruction every cycle, there are all sorts of reasons why on a given cycle, a warp may not be capable of executing its next instruction and will instead "stall" i.e. do nothing. The reasons for stalling can be due to capacity limits of various hardware pipelines, memory latency, or sychronization points in our kernel which require all the threads running on an SM to wait for all the other threads to catch up. The Warp State Statistics section tells us how many clock cycles the average warp spends stalled, per average instruction issued, broken down across a bunch of different categories. This gives us the information we need to target our optimizations to the least performant parts of our kernel. Here is a screenshot of what the Warp State section for Kernel 1.
+In order to improve the performance of our code, we need to know why it is slow. When writing CUDA kernels, the best tool to use for this is called NSight Compute, a profiler developed by NVIDIA that gives lots of detailed metrics about how a kernel is interacting with the hardware. The first place I typically look is the section called "Warp State Statistics". As a kernel is executing, each warp is being issued instructions by a scheduler. In an ideal world, the scheduler would be able to issue a new instruction each clock cycle. In the real world, it is very hard to write a kernel that can issue a new instruction every cycle, there are all sorts of reasons why on a given cycle, a warp may not be capable of executing its next instruction and will instead "stall" i.e. do nothing. The reasons for stalling can be due to capacity limits of various hardware pipelines, memory latency, or synchronization points in our kernel which require all the threads running on an SM to wait for all the other threads to catch up. The Warp State Statistics section tells us how many clock cycles the average warp spends stalled, per average instruction issued, broken down across a bunch of different categories. This gives us the information we need to target our optimizations to the least performant parts of our kernel. Here is a screenshot of what the Warp State section for Kernel 1.
 ![warp_state_kernel1](/images/warp_state_kernel1.png)
 The "Warp Cycles Per Issued Instruction" field tells us that on average for each instruction issued, warps spend about ~30 cycles idle, and the table below tells us that 16 of these 30 cycles are due to the "Long Scoreboard" stall category. 
 
@@ -525,7 +511,7 @@ In order to figure out what swizzle function we should use, lets look at the bin
 Some notes about what our swizzling function should do and not do:
 * We want to keep the eight elements in each MMA tile row together. In other words, eight adjacent elements in a single row of an 8x8 MMA tile are going to stay together when we apply the swizzle. This means our swizzle function is not going to touch the orange bits.
 * Bank conflicts occur because the 8 rows within an MMA tile are all perfectly stacked on top of each other. Within an MMA tile, we want to spread these 8 rows horizontally across the entire warp tile. The blue bits encode where in the 64 element wide warp tile each MMA tile falls, so these blue bits are the ones we want our swizzle function to modify.
-* We dont want to move elements between rows, so our swizzle function is not going to modify the green row bits. However, these green row bits provide a nice alternating pattern that we can XOR with the blue bits to mix around the rows of an MMA tile.
+* We dont want to move elements between rows, so our swizzle function is not going to modify the green row bits. However, these green row bits provide a nice alternating pattern that we can XOR with the blue bits to mix around the MMA tiles within their row.
 * Again, we dont want to be moving elements between rows, and the black bits (the most significant ones shown in this diagram) encode the starting row of each MMA tile. Our swizzle function is going to ignore them.
 
 So what this all means is that for each index, we want to take the blue bits, XOR them with the green bits, and replace the original blue bits with the result of this XOR. If `i` is the index we want to swizzle, this works out to:
@@ -587,28 +573,162 @@ This improved overlapping of data movement and compute is accomplished by
 Here is before/after pseudocode which shows how the data movement changes.
 ![prefetch](/images/prefetch.png)
 
-This produces a nice speedup over the previous kernel, and gets us to performance that is on par with the fastest CUTLASS hgemm kernel.
+This produces a nice speedup over the previous kernel, and gets us to ~70% of the HGEMM kernel.
 
 ![table4](/images/table4.png)
 
 ### GPU occupancy (digression)
 The potential cost of this optimization is that it requires additional register storage, each thread block stores two additional block tiles worth of data in register memory. According to the Launch Statistics section in NSight Compute, we go from using 104 registers per thread in Kernel 3, to 166 registers per thread in Kernel 4. This increase resource usage per thread has the *potential* to hurt kernel performance because it can impact how many threads the hardware is capable of executing concurrently. This is a quick digression on why increasing register use per thread has the potential to hurt performance, but why in this case, it doesn't.
 
-This gets to a topic called **occupancy** which is central to the CUDA hardware implementation. Each streaming multiprocessor (SM) will maintain block, warp, and thread execution state (shared memory, registers, program counter) on chip, for as many thread blocks as can be fit. The amount of thread blocks that can be fit on an SM depends on:
+This gets to a topic called occupancy which is central to the CUDA hardware and software implementation. Each streaming multiprocessor (SM) will maintain block, warp, and thread execution state (shared memory, registers, program counter) on chip, for as many thread blocks as can be fit. The amount of thread blocks that can be fit on an SM depends on:
 1. how much shared memory, registers per thread, and number of threads each thread block needs to execute (this a property of a given kernel, and the launch configuration of that kernel)
 2. how much shared memory, registers per thread, and number of threads the SM can handle at once (this is a property the device, and improves from generation to genereation)
 
 If a given kernel implementation and launch configuration require only a small number of registers, a few threads, and a small amount of shared memory, an SM can execute lots of thread blocks concurrently. When multiple thread blocks are executing concurrently on an SM, context switching between them is free. This allows the hardware to hide stalls and latency simply by tracking which threads are capable of executing their next instruction and which are not, and issuing instructions for whichever threads are ready. The more threads the SM has to choose from, the better this works. This is called [hardware multithreading](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#hardware-multithreading), and lots of older resources on CUDA performance talk about it as the primary guiding principle for writing fast kernels.
 
-However, this kernel (and many other kernels) require lots of registers per thread, which limits the number of thread blocks that can be resident on the SM at once, which in turn limits the hardwares ability to hide stalls automatically by context switching. Why do we need so many registers?
-- [This](#how-to-not-be-memory-bound-simple-memory-hierarchy) part of the background section goes through how a regular matrix multiplication requires $O(n^3)$ compute, but operates on only $O(n^2)$ data. 
+At this point, the limiting factor on the number of thread blocks that can be resident on an SM is shared memory. Each thread block is allocating a $(256,64)$ tile of shared memory for for the $A$ matrix, and a $(64,128)$ tile of shared memory for the $B$ matrix. This works out to 49KB of the total of 62KB of shared memory per SM, which limits the number of thread blocks that can be resident on an SM to one at a time. So in this instance, since shared memory is the limiting factor, using more registers per thread doesn't matter.
 
-### Async Copy on Ampere Architecture (digression)
-Ampere arch has a hardware instruction for moving data directly and asynchronously from global memory to shared memory, without going through a register.
+The high performance GEMM kernels typically have lower occupancy, meaning they use more shared memory and register memory per thread, and have less threads resident on an SM at once. This is primarily because of the need for high arithmetic intensity; in order to keep compute units busy with limited memory bandwidth, the more compute per thread at low levels of the memory hierarchy, the better. But the drawback of low occupancy is that the GPU will be less effective at automatic latency hiding via context switching. We can deal with this tradeoff by structuring our kernel to allow overlap between compute and data movement, this chapter is an example of this.
 
-## Kernel 5 - Tune Block Tile Dimensions
-Kernel 5 achieved ~35 TFLOP/s, which is on par with the fastest CUTLASS HGEMM kernel that I found, but still only achieves about ~62% of the ~51 TFLOP/s throughput of the cuBLAS HGEMM implementation. At this point I thought "darn, my goal was 100% of the cuBLAS throughput, and I have used a good number of performance tricks but I am only at 62%. Where should I focus the rest of my efforts?"
+The two newest NVIDIA architectures, Ampere and especially Hopper, introduce dedicated hardware suppport that allows us to perform several components of GEMM kernels asychronously (more on this in [conclusion](#conclusion)). This hardware support makes writing efficient, low occupancy kernels such as these ones much easier.
 
-One of the primary challenges when working on kernels such as this one is the (global) memory wall, that is the imbalance betweeen the high throughput of the tensor cores, and comparatively low global memory bandwidth. At this point I became curious, am I still memory bound?
+## Kernel 5 - Tune Tile Dimensions
+Up until this point, I found that after 10 minutes or so of looking at profiling results in NSight Compute, I would know exactly where the bottleneck in the kernel was, and what was causing it. After Kernel 4, which achieves about 70% of the cuBLAS thoughput, the profiler generally would not point to a single performance issue. In hindsight this was because the remaining 30% between kernel 4 and cuBLAS is the product of many smaller inneficiences, as opposed to one single one, and performance optimization began to have more of a trial and error flavor based on hunches, some of which turned out to be wrong. This chapter contains a description of two optimizations, that when implemented together produced a decent speedup.
+
+### tune tile dimensions
+
+At this point I began to wonder, if my kernel were still memory bound, how would I know? If you are using single precision FFMA instructions the "Speed of Light" section in NSight Compute will show you a roofline chart, but not if you are using tensor cores. I was inspired by [this](https://www.cse.ust.hk/~weiwa/papers/yan-ipdps20.pdf) paper to try to figure it out myself in a back of the envelope sort of way.
+
+A more actionable way to formulate the "am I memory bound?" question is "does the arithmetic intensity of my kernel exceed the machine's balance point?"
+
+$$ \frac{FLOPs\ performed}{bytes\ moved} \stackrel{?}{>} \frac{\tau}{\beta} $$
+
+So for the left hand side, we need to substitute in numbers that are specific to our kernel, and for the right hand side we need to subsitute numbers specific to our hardware. [This](#arithmetic-intensity-as-a-function-of-tile-dimensions) section went over how arithmetic intensity is a function of tile sizes. Namely for tile dimensions $BM,BN$ and $BK$, the arithmetic intensity we should expect is $\frac{BM * BN}{BM+BN}$. Here is a refresher of this, specific to the block tile level
+![intensity_block_tile_dims](/images/intensity_block_tile_dims.png) 
+Notice how $BK$ cancels out in this calculation. This means when thinking about arithmetic intensity, the size of our tiles along the $K$ dimension are irrelavent. However, when thinking about other aspects of performance it is not irrelavent (more on this later).
+
+#### M and N Dimensions / L2 cache locality
+We now need to subsitute in numbers for our machine balance. Earlier in the roofline charts we set $\tau_{HMMA}$ to the throughput of the cuBLAS hgemm kernel, which likely errs on the side of being an underestimate. In this case, the goal is to choose tile dimensions that are large enough to put us comfortably in the compute bound regime of the roofline chart, so I would like to instead err on the side of overestimating the arithmetic throughput in the numerator of the machine balance, and err on the side of underestimating the memory bandwidth in the denominator.
+
+A reasonable overestimate of $\tau_{HMMA}$ is 65,000 GFLOP/sec, which is the theoretical peak found on the T4 data sheet.
+
+When it comes to the memory bandwidth in the denominator, we want to conservatively estimate our achieved memory bandwidth. In order to do this, we need to consider the effect of the L2 cache. The L2 cache is shared between the 40 streaming multiprocessors on the T4. In practice this means that when one thread block accesses data from DRAM, it is moved into the L2 cache, and accesses to the same data originating from other thread blocks will hit the L2 cache, until this piece of data is evicted.
+
+According to [people on the internet](https://stackoverflow.com/questions/46660053/is-blockidx-correlated-to-the-order-of-block-execution), thread blocks execute in increasing order of their flattened block index. The official CUDA programming guide says that different thread blocks execute independently, and the programmer should not assume any relationship between different thread blocks. So relying on this assumption for correctness would probably be unwise, but for a quick and approximate calculation on L2 cache locality it is helpful.
+![l2_cache_locality](/images/l2_cache_locality.png)
+The basic idea here is that he accesses to the $A$ matrix from thread blocks executing at the same time have much better locality than accesses to the $B$ matrix. Most of the access to $A$ should hit the L2 cache, whereas most of the accesses to $B$ should miss, which means we should achieve roughly a 50% hit rate for global memory accesses. This means our *achieved* memory bandwidth is a 50/50 weighted sum between the DRAM bandwidth and our L2 cache bandwidth. Substituting this weighted sum in the denominator of the expression for machine balance finally gives us:
+
+$$ \frac{BM * BN}{BM+BN} \stackrel{?}{>} \frac{\tau_{HMMA}}{0.5 * \beta_{DRAM} + 0.5 * \beta_{L2}} $$
+
+Plugging the current block tile dimensions ($BM=256$ and $BN=128$), memory bandwidths, and theoretical arithmetic throughputs gives us
+
+$$ \frac{256 * 128\ FLOPs}{256 + 128\ bytes} \stackrel{?}{>} \frac{65,000 * 10^9\ FLOPs/sec}{0.5 * 220 * 10^9 + 0.5 * 1280 * 10^9\ bytes/sec} $$
+
+which works out to an arithmetic intensity of $85.3 \frac{FLOPs}{byte}$ and a machine balance of $87.24 \frac{FLOPs}{byte}$. The fact that these two numbers are very close suggests that global memory access may still be dominating our overall runtime. If we can spare the space in shared memory, increasing our $BN$ dimension from 128 to 256 might be worthwhile. If $BM$ and $BN$ are both 256, our estimated arithmetic intensity becomes $128.0 \frac{FLOPs}{byte}$, which should hopefully put us comfortablly in the compute bound regime.
+
+
+When considering the next level down in the hierarchy, the high shared memory bandwidth gives us a bit more wiggle room. Our swizzled shared memory layouts should result in bank conflict free access, giving us the full bandwidth of 3662 GB/sec. The $WM$ and $WN$ dimensions of the warp tiles are both 64. Plugging numbers into here:
+
+$$ \frac{WM * WN}{WM+WN} \stackrel{?}{>} \frac{\tau_{HMMA}}{\beta_{shmem}} $$
+
+gives an arithmetic intensity of $32 \frac{FLOP}{byte}$ and a balance point of $17.7 \frac{FLOP}{byte}$. Thus it is safe to assume that shared memory loads are not the dominant factor in our kernel's runtime. However, in order to err on the size of more arithmetic intensity I also ended up increasing $WM$ and $WN$ while making $WK$ smaller.
+
+#### K Dimension
+Different considerations come into play when considering our tile sizes along the K dimension. In our pencil and paper analysis, the tile size along the K dimension cancels out of the expression for arithmetic intensity. When thinking about tile lengths along this dimension, different considerations come into play. First, we can use it to adjust the total size of our tiles without affecting arithmetic intensity. In the case of block tiles, the total amount of bytes of shared memory they consume is $BK* (BM+ BN)* sizeof(half)$, thus increasing $BK$ by a unit increases the total size of the block tiles by $(BM+ BN)* sizeof(half)$. In deciding the length of the block tiles along the K dimension, this becomes the primary consideration. With $BN=256,BM=256$ we choose $BK=32$, with these dimensions the total amount of shared memory used by tiles of $A$ and $B$ works out to 32KiB, which is exactly half of the shared memory per streaming multiprocessor. This decision makes sense in the next section, which discusses a technique called shared memory double buffering. This optimization involves allocating two buffers in shared memory corresponding to each input matrix, so one can be written to while the other is being read. When double buffering is implemented, with these tile dimensions we will be using every available byte of shared memory on the device.
+
+### tile dimensions - longer and thinner
+Here is a visualization of the before/after:
+![tile_dims_adjustment.png](/images/tile_dims_adjustment.png)
+Both block tiles and warp tiles are made longer, and narrower along the K dimension, in order to increase arithmetic intensity. For the sake of time I combined this optimizations with the optimizations discussed below, so I did not measure the performance improvmement of this in isolation.
+
+## Kernel 5 - Optimize Index Calculation
+At this point I was at about 70% of cuBLAS performance, my main strategy for using NSight Compute was to compare kernel metrics between my kernels and the cuBLAS HGEMM kernel. While the source code of the cuBLAS HGEMM implementation is not released by NVIDIA, looking at its metrics collected by NSight Compute can give us some insights into the sorts of optimization techniques that the clever folks at NVIDIA might have used when writing it.
+
+The one thing that jumped out at me was that the total number of executed instructions of cuBLAS HGEMM was $94,175,232$, whereas Kernel 4 was executing $216,227,840$, over twice as many instructions as compared to Kernel 4. While Kernel 4 partly compensates for this by having a lower cycles per instruction ratio (8ish, vs 12ish for cuBLAS), this is certainly worth looking into.
+
+So I wondered, why is my kernel executing twice as many instructions? Expanding the instruction mix section in NSight Compute gives us more information.
+![instruction_mix_comparison](/images/instruction_mix_comparison.png)
+The answer is that Kernel 4 is performing way more index calcuation related instructions than the cuBLAS kernel. The `LOP`, `IADD3`, and `SHF` instructions are integer and logical instructions, these are different pipelines from the tensor core and can execute concurrently with floating point math happening elsewhere on the chip. However, each warp scheduler on a streaming multiprocessor can only issue a single instruction per cycle, and so the large number of index calculation instructions is likely crowding out the issuing of the `HMMA` instructions, these are the tensor core instructions doing the heavy lifting. So what are these integer and logical instructions doing, and why are there so many of them?
+
+According to NSight Compute, 92% of the total instructions executed by Kernel 4 are in the loop nest where each warp loads its region of data from shared memory into register memory, and then performs an outer product over local matrices stored in register memory with a series of `HMMA` instructions. The three nested loops that map the `HMMA` instructions to their position are all fully unrolled, so there isn't any runtime index calculation required there.
+
+However, the `HMMA` instructions operate on $8$ by $8$ tiles stored in registers, and before the compute phase the threads in each warp work collaboratively to load all of these tiles from swizzled shared memory into register memory using the `ldmatrix` PTX instruction (see [here](#how-to-use-tensor-cores)) for an explanation of `ldmatrix`. Since at this point we are all the down at the bottom level of the tile hierarchy, the tiles are very small, and consequently we are doing this index calculation *lots* of times ($O(\frac{N^3}{8})$), and it involves multiplying by a bunch of strides, computing a modulo WRT the thread index, and several logical operations to apply the swizzling function, all of which happens at runtime.
+
+![index_calculation_inneficient](/images/index_calculation_inneficient.png)
+
+In order to make this more performant, we should move as much of this calculation as possible to happen at compile time, and whatever needs to happen at runtime should be as streamlined as possible. In the index calculation code shown above, fundamentally there are three distinct and dependent steps
+1. First each warp computes the memory address of the top left corner of the mma tile
+2. Each thread calculates the memory address of the element it will load, relative to (1)
+3. Because our shared memory layout is swizzled, each thread applies the swizzle function to the address computued in (2)
+in order to get the correct memory address in the swizzled layout.
+
+
+All three steps are done for each of the 8x8 MMA tiles. Below is a visualization of this, the diagram below is a mini example where each MMA tile is four rows and one column, and each warp tile has 2x8 MMA tiles (using simpler examples like this allows us to make all the details as explicit as possible, and the :smiling_imp: is in the details).
+
+![swizzled_index_calculation_inneficient](/images/swizzled_index_calculation_inneficient.png)
+
+In the middle column, each thread has calculated the address of the value it is going to load, in the unswizzled layout. Each iteration, these pointers are advanced to the right by one column, until we get to the end of the warp tile at which point we go down to the next set of rows. If it weren't for the swizzled layout, we could just advance the pointers by one each iteration, i.e. `thread_row+=1`. However, because the data is stored in a swizzled layout, advancing the pointers over to the next group of MMA tiles is not simply a matter of incrementing by one.
+
+While incrementing by one will not work for iterating over a swizzled layout, we can achieve the equivalent effect by XORing each threads pointer with a constant.
+![swizzled_index_calculation_efficient](/images/swizzled_index_calculation_efficient.png)
+This reduces the amount of index calculation from \~13 operations in between each `ldmatrix`, down to a single XOR. After applying this optimization, the total number of instructions executed goes down to \~90M, which is slightly less than cuBLAS.
+
+This illustrates the basic principle of efficiently iterating through a swizzled data layout.  In the [actual code](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel5.cu#L10), it is a bit more complicated because the swizzle function is more complicated, and we need to iterate through the tiles of A and B which have different dimensions from each other. Also the loops containing the `ldmatrix` instructions are manually unrolled, this makes the XORing easier, and also might allow the compiler to do a better job of interleaving the `ldmatrix` and `mma.sync` instructions to balance load between the two different pipelines.
+
+The optimized index calcuation, loop unrolling, and adjusted tile dimensions are all implemented as part of the same kernel, that achieves a hard fought 1.2x speedup over the last one, and gets us to 86.7% of cuBLAS throughput.
+![table5](/images/table5.png)
 
 ## Kernel 6 - Double Buffering
+Back to the profiler (for the last time). At this point many of the metrics between my kernel and cuBLAS were starting to look somewhat similiar. One thing that jumped out at me was that the threads in my kernel spend more time stalled on `__syncthreads()` than the cuBLAS kernel. At this point my kernel had a CPI (cycles per instruction) of 14, and about 2.6 of these cycles come from sychronization stalling. So this was not an egregious performance issue, but noticeable. A technique called double buffering enables you to remove one of the two `__syncthreads()` in the inner loop. After a bit of pondering I realized that this provides no guaruntee of a proportional decrease in cycles stalled on `__syncthreads()` (if you remove one `__syncthreads()`, threads might spend twice as much time stalled on the other). However, double buffering should also allow for a bit more instruction level parallelism inside the main loop, and it is implemented in CUTLASS kernels, and I had the shared memory to spare, so why not.
+
+The data dependencies inside the main loop of our current GEMM kernel necessitate having two `__syncthreads()` in order to prevent race conditions in shared memory
+![two_syncthreads](/images/two_syncthreads.png)
+If we removed either, race conditions would occur because the thread to data mapping is different when writing to shared memory vs. reading it. This is because any given thread is computing on different values than the ones that it fetched from global memory and wrote to shared memory. This means that sychronization points are required to prevent race conditions, because the whole thread block must wait until all threads are done writing to shared memory before any thread starts reading from shared memory.
+
+The cost of these sychronization points is less parallelism and potentially less hardware utilization. As the diagram above shows, there are four main components to the main loop.
+1. prefetching the next block tile into registers
+2. shared memory to register transfer in preparation for compute
+3. compute
+4. writing the prefetched data back from registers to shared memory
+
+As the diagram above illustrates #4 is kept seperate from the other three because it involves writing to the data that is being read in #2, i.e. all 256 threads in a block must complete #2 before any start #4. This seperation is bad for performance, because it limits the compilers ability to interleave instructions of different types to balance load across different hardware pipelines.
+
+The idea behind double buffering is that if we allocate an extra pair of shared memory buffers for the block tiles of $A$ and $B$, we can write to one pair of buffers concurrently with the other being read. This allows us to remove the second `__syncthreads()` from the mainloop. This should make things a bit faster.
+
+![one_syncthreads](/images/one_syncthreads.png)
+
+The two things that changed here are the removal of one of the `__syncthreads()`, and the addition of an index that we always use  (`%2`) to track which of the two buffers is being read, and which is being written on any given iteration. The buffer that is being read and the buffer that is being written switches each iteration.
+
+![double_buffering](/images/double_buffering.png)
+
+This results in a small speedup over the previous kernel. But at this stage of trying to optimize an already highly optimized kernel, I'll take what I can get.
+
+![table_6](/images/table6.png)
+
+# Conclusion
+## things I didn't do
+And this is where I called it a day! There are two avenues for further performance improvement, but the time I alloted to work on this ran out. The former is a lot easier than the latter.
+- **optimized epiloge**- As a reminder, the GEMM problem is $D=\alpha * A * B + \beta * C$. This is two computations stuffed into one kernel. The bulk of the compute is in the matrix multiplication $C^\*=A * B$. Once we multiply the two matrices, then we do $D = \alpha * C^*  + \beta * C$, this is generally referred to as the kernel epilogue. The former is an $O(N^3)$ problem, the later is $O(N^2)$. When N is large, the matrix multiplication dominates the runtime of the combined algorithm, when N is smaller the epilogue is more significant. The article focused entirely on the matrix multiplication, as this is the most interesting and important component of the GEMM problem. The kernel epilogue I used in all six kernels is innefficient - once the matrix multiplication is complete, the result is scattered across thread registers according to the `m16n8k8` MMA layout (see [below](#appendix)), and they are written directly back to memory. This write is uncoalesced and consequently achieves less than ideal bandwidth and latency. Improving this would likely narrow the gap between Kernel 6 and cuBLAS for smaller matrix sizes.
+- **manual instruction mix tuning for inner loop**- Projects like [this](https://github.com/NervanaSystems/maxas/wiki/SGEMM) and [this](https://github.com/daadaada/turingas) match/exceed the performance of cuBLAS using custom built assemblers that allow them to write the kernel entirely in SASS. The inner loop of a GEMM kernel consists of shared memory loads and math instructions. If too many instructions of one type are grouped together, hardware pipelines will get overloaded and stall cycles will be incurred. If you want to write your kernels entirely in CUDA and PTX as I did, then instruction scheduling is the job of the compiler, the fact that I was able to get >90% of cuBLAS performance without any inlined assembly means that nvcc probably does a pretty good job at it. However, if one were really determined to write a kernel that is as fast or faster than cuBLAS for a range of matrix sizes, this would avenue would likely be necesssary.
+
+## performance on different matrix sizes
+Here is a plot that shows the performance of the kernels I wrote, compared to cuBLAS, for a bunch of different matrix dimensions.
+![hgemm_performance](/images/hgemm_performance.png)
+
+Note that the gap between the fastest kernel I wrote, and cuBLAS HGEMM is slightly larger for smaller matrices, possibly due to my unoptimized epilogue. Also possibly due to the fact that cuBLAS is selecting kernels that have been specifically tuned for those matrix dimensions.
+
+## lessons learned, newer GPUs are better
+Given how many people and companies these days are buying NVIDIA GPUs almost exclusively for the purpose of running matrix multiplications, it seems like lots of work goes into improving the tensor cores in terms of programmability and performance between successive architectures. The tensor core throughput goes up by an order of magnitude with each new SM architecture, and the memory bandwidth also increases, but not proportionally.
+
+In order to make the task of programming these powerful but imbalanced machines more manageable, the more recent Ampere and Hopper architectures introduced hardware support that enable several important parts of a GEMM kernel to run asychronously with respect to the rest of the SM. Ampere introduced hardware support for [asychronous data copying](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html#asynchronous-data-copy-from-global-memory-to-shared-memory) from global memory to shared memory, I implemented a sort of hacked version of this using extra registers in [Kernel 4](#kernel-4---makeshift-async-copy). The Hopper architecture introduced something even fancier called the [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator), which is essentially a copy engine that can perform index calculation, and initiate global memory transfers asychronously with respect to the rest of the SM. Thus developers writing kernels for Hopper probably dont have to worry about the efficiency of index calculation (like we did [here](#kernel-5---optimize-index-calculation)), because this is offloaded to dedicated hardware in the TMA. Hopper also has asychronous tensor core instructions, that can read/write from/to shared memory, rather than registers (see [here](https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/)). 
+
+All of this asychronicity is a great thing for low occupancy, register hungry GEMM kernels. As discussed [here](#gpu-occupancy-digression), large arithmetic throughput means we need lots of fast memory to cache data, which means we cant run that many threads per SM, which means the GPU wont automatically hide our latency by context switching, which means we the programmer need to think more about our latency is being hidden. This is where this asychronicity is helpful.
+
+All of this means that Hopper is kind of a new and different beast, if you look at GEMM kernels in CUTLASS that target Hopper the code has a different stucture than all of the other pre `sm_90` kernels. Hopper kernels use a producer/consumer pattern, where a relatively small number of producer threads are initiating asynchronous data copies with the TMA, and then consumer threads are managing the tensor cores. I have never worked on kernels targetting Hopper so I dont know much about this at the moment, [this](https://hazyresearch.stanford.edu/blog/2024-05-12-tk) article provides an interesting overview of the user experience of writing kernels for Hopper.
+
+This is all to say that the kernels discussed here target the Turing architecture, which was SOTA in 2018, and if you are writing kernels targeting Ampere or Hopper, the techniques you employ for latency hiding will be different and easier. I used the Tesla T4 GPU because you can rent them on AWS for ~50 cents/hour, which is about as much money as I want to spend on EC2 instances. Using an older GPU was a blessing and a curse for this project, the curse was that no special hardware support was available for hiding memory latency on calculating indices, the blessing was that I had to do all this myself which was an educational experience!
+
+# Are you hiring GPU nerds?
+I am usually not one for self promotion, but I recently took a bit of a break from work, and now am back on the job market. If you are a hiring manager who is looking for someone to fiddle around with kernels, profilers, and/or compilers please email me!
+
+
