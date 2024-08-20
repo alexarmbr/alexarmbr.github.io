@@ -6,7 +6,6 @@ date:   2024-08-10 08:52:08 -0600
 categories: jekyll update
 --- -->
 
-
 {% include mathjax.html %}
 
 * TOC
