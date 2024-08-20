@@ -1,8 +1,8 @@
 
 <!-- ---
 layout: post
-title:  "Optimizing matrix multiplication on NVIDIA Tensor Cores"
-date:   2024-06-13 08:52:08 -0600
+title:  "How To Write A Fast Matrix Multiplication From Scratch With NVIDIA Tensor Cores"
+date:   2024-08-10 08:52:08 -0600
 categories: jekyll update
 --- -->
 
@@ -722,7 +722,7 @@ Given how many people and companies these days are buying NVIDIA GPUs almost exc
 
 In order to make the task of programming these powerful but imbalanced machines more manageable, the more recent Ampere and Hopper architectures introduced hardware support that enable several important parts of a GEMM kernel to run asychronously with respect to the rest of the SM. Ampere introduced hardware support for [asychronous data copying](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html#asynchronous-data-copy-from-global-memory-to-shared-memory) from global memory to shared memory, I implemented a sort of hacked version of this using extra registers in [Kernel 4](#kernel-4---makeshift-async-copy). The Hopper architecture introduced something even fancier called the [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator), which is essentially a copy engine that can perform index calculation, and initiate global memory transfers asychronously with respect to the rest of the SM. Thus developers writing kernels for Hopper probably dont have to worry about the efficiency of index calculation (like we did [here](#kernel-5---optimize-index-calculation)), because this is offloaded to dedicated hardware in the TMA. Hopper also has asychronous tensor core instructions, that can read/write from/to shared memory, rather than registers (see [here](https://research.colfax-intl.com/cutlass-tutorial-wgmma-hopper/)). 
 
-All of this asychronicity is a great thing for low occupancy, register hungry GEMM kernels. As discussed [here](#gpu-occupancy-digression), large arithmetic throughput means we need lots of fast memory to cache data, which means we cant run that many threads per SM, which means the GPU wont automatically hide our latency by context switching, which means we the programmer need to think more about our latency is being hidden. This is where this asychronicity is helpful.
+All of this asychronicity is a great thing for low occupancy, register hungry GEMM kernels. As discussed [here](#gpu-occupancy-digression), large arithmetic throughput means we need lots of fast memory to cache data, which means we cant run that many threads per SM, which means the GPU wont automatically hide our latency by context switching, which means we the programmer need to think more about our latency is being hidden. This is where asychronicity is helpful.
 
 All of this means that Hopper is kind of a new and different beast, if you look at GEMM kernels in CUTLASS that target Hopper the code has a different stucture than all of the other pre `sm_90` kernels. Hopper kernels use a producer/consumer pattern, where a relatively small number of producer threads are initiating asynchronous data copies with the TMA, and then consumer threads are managing the tensor cores. I have never worked on kernels targetting Hopper so I dont know much about this at the moment, [this](https://hazyresearch.stanford.edu/blog/2024-05-12-tk) article provides an interesting overview of the user experience of writing kernels for Hopper.
 
