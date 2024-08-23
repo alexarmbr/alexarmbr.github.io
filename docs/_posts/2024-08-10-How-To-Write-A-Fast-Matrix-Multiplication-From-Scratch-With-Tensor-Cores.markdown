@@ -730,6 +730,11 @@ All of this means that Hopper is kind of a new and different beast, if you look 
 
 This is all to say that the kernels discussed here target the Turing architecture, which was SOTA in 2018, and if you are writing kernels targeting Ampere or Hopper, the techniques you employ for latency hiding will be different and easier. I used the Tesla T4 GPU because you can rent them on AWS for ~50 cents/hour, which is about as much money as I want to spend on EC2 instances. Using an older GPU was a blessing and a curse for this project, the curse was that no special hardware support was available for hiding memory latency on calculating indices, the blessing was that I had to do all this myself which was an educational experience!
 
+# Resources / Acknowledgements
+- I learned about the roofline model from Prof. Vuduc's Intro to High Performance Computing class at Georgia Tech, all of the course videos are available [here](https://edstem.org/us/join/GT3Qcc), these videos are an amazing free resource if you have the time and inclination to watch them. The part of this article about rooflines and computational intensity is similiar to what is presented in the "Basic Model of Locality" section.
+- [This](https://siboehm.com/articles/22/CUDA-MMM) article was a major source of inspiration for this project. Simon's other articles are excellent as well, this is probably one of my favorite blogs on the internet at the moment.
+- [Another](https://horace.io/brrr_intro.html) excellent blog about a systems view of ML. This article in particular is a very readable explanation of why things like memory bandwidth and arithmetic intensity matter when training neural nets on GPUs.
+
 # Are you hiring GPU nerds?
 I am usually not one for self promotion, but I recently took a bit of a break from work, and now am back on the job market. If you are a hiring manager who is looking for someone to fiddle around with kernels, profilers, and/or compilers please email me!
 
