@@ -23,7 +23,7 @@ I figured out the implementation details mostly by digging around the NVIDIA [CU
 
 When I started my goal was to write a kernel with comparable performance to the cuBLAS [hgemm](https://docs.nvidia.com/cuda/cublas/#cublas-level-3-function-reference) implementation, which is the closed-source, gold standard implementation released by NVIDIA. I iteratively optimized a series of 6 kernels, with the [first](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel1.cu) achieving a measly 8% of the cuBLAS throughput, and the [last](https://github.com/alexarmbr/matmul-playground/blob/main/src/kernel6.cu) achieving a decent 96% of the cuBLAS throughput for 8192x8192 matrices.
 
-This article contains a background section that explains some theory that is helpful to have in your head when thinking about how to optimize kernels that operate on matrices. The rest of the article explains six algorithmic techniques that I used to make my kernel run as fast as possible.
+This article contains a background section that explains some theory that is helpful to have in your head when thinking about how to optimize kernels that operate on matrices. The rest of the article explains six algorithmic techniques that I used to make my kernel run as fast as possible. Code can be found [here](https://github.com/alexarmbr/matmul-playground) on github.
 
 Here is a table with the performance comparison of all of the kernels:
 ![table6](/images/table6.png)
