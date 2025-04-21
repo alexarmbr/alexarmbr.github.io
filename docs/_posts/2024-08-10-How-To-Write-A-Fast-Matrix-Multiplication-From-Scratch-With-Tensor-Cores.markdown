@@ -739,7 +739,5 @@ Most of these resources have already been linked to in various places throughout
 - Great [article](https://hazyresearch.stanford.edu/blog/2024-05-12-tk) from a systems ML lab at stanford about the kernel engineering for the Hopper architecture.
 - [This](https://github.com/NVIDIA/cutlass) is NVIDIA's CUTLASS project, provides a bunch of abstractions that make it easier to write fast kernels.
 
-# Are you hiring GPU nerds?
-I am usually not one for self promotion, but I recently took a bit of a break from work, and now am back on the job market. If you are a hiring manager who is looking for someone to fiddle around with kernels, profilers, and/or compilers please email me!
 
 
